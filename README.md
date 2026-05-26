@@ -149,7 +149,7 @@ SQLite с таблицами:
 ```
 Telegram__ApiId=12345678
 Telegram__ApiHash=your_hash
-Telegram__PhoneNumber=+77076298774
+Telegram__PhoneNumber=
 Ai__AiApiKey=sk-...
 Ai__AiModelName=gpt-3.5-turbo
 Ai__AiBaseUrl=https://api.openai.com/v1/
