@@ -23,7 +23,7 @@ internal class DomainModels
     {
         public long FavoriteChatId { get; set; }       // ID чата «Избранное», где принимаются команды
         public long OwnerUserId = 7499022252;          // ваш пользовательский ID в Telegram
-        public string? NeuralApiToken { get; set; } = "AIzaSyBojKTXEavRO6qsDQmbW8Hyv7nI8hH5WOE";    // токен для API нейросети уникализации
+        public string? NeuralApiToken { get; set; } = "";    // токен для API нейросети уникализации
         public bool UseSendChatAction { get; set; } = true; // использовать ли SendChatAction перед отправкой
     }
 
