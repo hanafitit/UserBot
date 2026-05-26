@@ -28,7 +28,7 @@ cd TestApp
   "Telegram": {
     "ApiId": 12345678,
     "ApiHash": "your_api_hash",
-    "PhoneNumber": "+77076298774",
+    "PhoneNumber": "+77000000000",
     "Password2Fa": "optional_2fa_password"
   },
   "Ai": {
