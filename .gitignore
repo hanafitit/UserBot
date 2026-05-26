@@ -1,0 +1,12 @@
+bin/
+obj/
+sessions/
+*.db
+*.db-shm
+*.db-wal
+appsettings.Development.json
+appsettings.json
+.vs/
+.vscode/
+*.log
+*.swp
