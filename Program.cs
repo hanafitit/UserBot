@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -73,8 +74,50 @@ using var host = builder.Build();
 
 await using (var scope = host.Services.CreateAsyncScope())
 {
-    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    await db.Database.MigrateAsync();
+    var config = scope.ServiceProvider.GetRequiredService<IConfiguration>();
+    var connString = config.GetConnectionString("DefaultConnection");
+    var dbFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<AppDbContext>>();
+
+    try
+    {
+        if (!string.IsNullOrWhiteSpace(connString))
+        {
+            var builderSqlite = new SqliteConnectionStringBuilder(connString);
+            if (!string.IsNullOrWhiteSpace(builderSqlite.DataSource) && !builderSqlite.DataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
+            {
+                var fullPath = Path.GetFullPath(builderSqlite.DataSource);
+                var directory = Path.GetDirectoryName(fullPath);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                Console.WriteLine($"База данных SQLite: {fullPath}");
+            }
+        }
+
+        await using var db = await dbFactory.CreateDbContextAsync();
+        var connection = db.Database.GetDbConnection();
+        await connection.OpenAsync();
+        await db.Database.MigrateAsync();
+        await connection.CloseAsync();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine();
+        Console.Error.WriteLine("❌ Ошибка при выполнении миграций БД:");
+        Console.Error.WriteLine($"   {ex.Message}");
+        Console.Error.WriteLine();
+        Console.Error.WriteLine("Диагностика окружения (ConnectionStrings):");
+        foreach (var entry in Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>())
+        {
+            var key = entry.Key.ToString() ?? "";
+            if (key.StartsWith("ConnectionStrings__", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.Error.WriteLine($"  {key} = {SanitizeConnectionString(entry.Value?.ToString())}");
+            }
+        }
+        throw;
+    }
 }
 
 await using var telegram = host.Services.GetRequiredService<TelegramClientManager>();
@@ -151,6 +194,7 @@ static void PrintTelegramConfigHelp(TelegramAppSettings? settings, string? error
         var key = entry.Key.ToString() ?? "";
         if (key.StartsWith("Telegram__", StringComparison.OrdinalIgnoreCase) ||
             key.StartsWith("Ai__",       StringComparison.OrdinalIgnoreCase) ||
+            key.StartsWith("ConnectionStrings__", StringComparison.OrdinalIgnoreCase) ||
             knownKeys.Contains(key))
         {
             var val = entry.Value?.ToString();
@@ -159,6 +203,9 @@ static void PrintTelegramConfigHelp(TelegramAppSettings? settings, string? error
                          key.Contains("Pass",  StringComparison.OrdinalIgnoreCase) ||
                          key.Contains("Token", StringComparison.OrdinalIgnoreCase)
                          ? SanitizeHash(val) : val;
+
+            if (key.StartsWith("ConnectionStrings__", StringComparison.OrdinalIgnoreCase))
+                masked = SanitizeConnectionString(val);
             Console.Error.WriteLine($"  {key} = {masked}");
             foundAny = true;
         }
@@ -188,4 +235,20 @@ static string SanitizeHash(string? hash)
     if (string.IsNullOrWhiteSpace(hash)) return "(не задано)";
     if (hash.Length <= 4) return "****";
     return $"{hash[0]}...{hash[^1]} ({hash.Length} симв.)";
+}
+
+static string SanitizeConnectionString(string? connectionString)
+{
+    if (string.IsNullOrWhiteSpace(connectionString)) return "(не задано)";
+    try
+    {
+        var builder = new SqliteConnectionStringBuilder(connectionString);
+        var dataSource = builder.DataSource;
+        if (string.IsNullOrWhiteSpace(dataSource)) return "****";
+        return $"Data Source={dataSource}; (другие параметры скрыты)";
+    }
+    catch
+    {
+        return SanitizeHash(connectionString);
+    }
 }
