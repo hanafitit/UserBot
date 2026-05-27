@@ -2,7 +2,6 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using System.IO;
 using TestApp.Configuration;
 using TestApp.Data;
 using TestApp.Services;
@@ -15,16 +14,14 @@ WTelegram.Helpers.Log = (_, _) => { };
 
 var builder = Host.CreateApplicationBuilder(args);
 
-// Гарантируем подгрузку переменных окружения (обычно включено по умолчанию в CreateApplicationBuilder, но добавим явно)
-builder.Configuration.AddEnvironmentVariables();
-
-var telegramSettings = new TelegramAppSettings();
-builder.Configuration.GetSection(TelegramAppSettings.SectionName).Bind(telegramSettings);
+var telegramSettings = builder.Configuration
+    .GetSection(TelegramAppSettings.SectionName)
+    .Get<TelegramAppSettings>();
 
 var (isValid, errorMessage) = ValidateTelegramConfig(telegramSettings);
 if (!isValid)
 {
-    PrintTelegramConfigHelp(telegramSettings, errorMessage, builder.Configuration);
+    PrintTelegramConfigHelp(telegramSettings, errorMessage);
     return 1;
 }
 
@@ -51,30 +48,10 @@ builder.Services.AddHostedService<AdvertisingScheduler>();
 
 using var host = builder.Build();
 
-try
+await using (var scope = host.Services.CreateAsyncScope())
 {
-    await using (var scope = host.Services.CreateAsyncScope())
-    {
-        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-
-        var connectionString = builder.Configuration.GetConnectionString("DefaultConnection");
-        if (connectionString != null && connectionString.StartsWith("Data Source=", StringComparison.OrdinalIgnoreCase))
-        {
-            var dbPath = connectionString.Substring("Data Source=".Length).Trim();
-            var directory = Path.GetDirectoryName(dbPath);
-            if (!string.IsNullOrEmpty(directory))
-            {
-                Directory.CreateDirectory(directory);
-            }
-        }
-
-        await db.Database.MigrateAsync();
-    }
-}
-catch (Exception ex)
-{
-    Console.Error.WriteLine($"Критическая ошибка при инициализации базы данных: {ex.Message}");
-    return 1;
+    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    await db.Database.MigrateAsync();
 }
 
 await using var telegram = host.Services.GetRequiredService<TelegramClientManager>();
@@ -127,15 +104,13 @@ return 0;
 
 static (bool IsValid, string? ErrorMessage) ValidateTelegramConfig(TelegramAppSettings? settings)
 {
-    if (settings == null || (settings.ApiId == 0 && string.IsNullOrWhiteSpace(settings.ApiHash)))
-        return (false, "Секция конфигурации 'Telegram' не найдена или пуста.");
-
+    if (settings == null) return (false, "Секция конфигурации 'Telegram' не найдена.");
     if (settings.ApiId <= 0) return (false, "Telegram:ApiId должен быть положительным числом.");
     if (string.IsNullOrWhiteSpace(settings.ApiHash)) return (false, "Telegram:ApiHash не может быть пустым.");
     return (true, null);
 }
 
-static void PrintTelegramConfigHelp(TelegramAppSettings? settings, string? error, IConfiguration configuration)
+static void PrintTelegramConfigHelp(TelegramAppSettings? settings, string? error)
 {
     Console.Error.WriteLine();
     Console.Error.WriteLine("Ошибка конфигурации Telegram API:");
@@ -144,27 +119,6 @@ static void PrintTelegramConfigHelp(TelegramAppSettings? settings, string? error
     Console.Error.WriteLine("Текущие загруженные значения (проверьте правильность имен переменных окружения):");
     Console.Error.WriteLine($"  Telegram:ApiId   = {(settings?.ApiId != 0 ? settings?.ApiId : "(не задано)")}");
     Console.Error.WriteLine($"  Telegram:ApiHash = {SanitizeHash(settings?.ApiHash)}");
-    Console.Error.WriteLine();
-
-    Console.Error.WriteLine("Обнаруженные переменные окружения (с префиксом Telegram__ или Ai__):");
-    var foundAny = false;
-    foreach (var entry in Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>())
-    {
-        var key = entry.Key.ToString() ?? "";
-        if (key.StartsWith("Telegram__", StringComparison.OrdinalIgnoreCase) ||
-            key.StartsWith("Ai__", StringComparison.OrdinalIgnoreCase))
-        {
-            var val = entry.Value?.ToString();
-            var masked = key.Contains("Hash", StringComparison.OrdinalIgnoreCase) ||
-                         key.Contains("Key", StringComparison.OrdinalIgnoreCase) ||
-                         key.Contains("Pass", StringComparison.OrdinalIgnoreCase)
-                         ? SanitizeHash(val) : val;
-            Console.Error.WriteLine($"  {key} = {masked}");
-            foundAny = true;
-        }
-    }
-    if (!foundAny) Console.Error.WriteLine("  (переменные не найдены)");
-
     Console.Error.WriteLine();
     Console.Error.WriteLine("Инструкция по настройке:");
     Console.Error.WriteLine("1) Откройте https://my.telegram.org/apps и создайте приложение.");
