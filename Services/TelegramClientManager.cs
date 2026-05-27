@@ -34,11 +34,6 @@ public sealed class TelegramClientManager : IAsyncDisposable
     /// <summary>
     /// Создаёт клиент, подключается к Telegram и выполняет вход (или восстанавливает сессию из файла).
     /// </summary>
-    /// <param name="cancellationToken">Токен отмены ожидания при FLOOD_WAIT.</param>
-    /// <returns>Профиль вошедшего пользователя.</returns>
-    /// <exception cref="TelegramFloodWaitException">
-    /// Превышено число автоматических повторов при FLOOD_WAIT.
-    /// </exception>
     public async Task<User> LoginAsync(CancellationToken cancellationToken = default)
     {
         const int maxFloodRetries = 5;
@@ -101,7 +96,7 @@ public sealed class TelegramClientManager : IAsyncDisposable
     }
 
     /// <summary>
-    /// Callback конфигурации WTelegramClient: отдаёт api_id/api_hash, путь сессии и ответы для входа.
+    /// Callback конфигурации WTelegramClient.
     /// </summary>
     private string? Config(string what)
     {
@@ -170,6 +165,25 @@ public sealed class TelegramClientManager : IAsyncDisposable
         var directory = Path.GetDirectoryName(fullPath);
         if (!string.IsNullOrEmpty(directory))
             Directory.CreateDirectory(directory);
+
+        // Восстанавливаем сессию из переменной окружения SESSION_BASE64 (для Render и других облаков)
+        if (!File.Exists(fullPath))
+        {
+            var sessionBase64 = Environment.GetEnvironmentVariable("SESSION_BASE64");
+            if (!string.IsNullOrWhiteSpace(sessionBase64))
+            {
+                try
+                {
+                    var bytes = Convert.FromBase64String(sessionBase64);
+                    File.WriteAllBytes(fullPath, bytes);
+                    _logger.LogInformation("Сессия восстановлена из SESSION_BASE64");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Не удалось восстановить сессию из SESSION_BASE64");
+                }
+            }
+        }
 
         _logger.LogDebug("Файл сессии: {SessionPath}", fullPath);
         return fullPath;
