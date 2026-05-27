@@ -141,6 +141,22 @@ try
     if (Console.IsInputRedirected)
     {
         Console.WriteLine("Планировщик рассылки активен. Ожидание сигнала завершения...");
+        // Минимальный HTTP-сервер для Render (он требует открытый порт)
+var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
+var httpListener = new System.Net.HttpListener();
+httpListener.Prefixes.Add($"http://*:{port}/");
+httpListener.Start();
+_ = Task.Run(async () =>
+{
+    while (httpListener.IsListening)
+    {
+        var ctx = await httpListener.GetContextAsync();
+        ctx.Response.StatusCode = 200;
+        await ctx.Response.OutputStream.WriteAsync("OK"u8.ToArray());
+        ctx.Response.Close();
+    }
+});
+Console.WriteLine($"HTTP listener started on port {port}");
         await host.WaitForShutdownAsync();
     }
     else
