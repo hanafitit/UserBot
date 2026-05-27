@@ -4,7 +4,7 @@ using TestApp.Data.Models;
 namespace TestApp.Data;
 
 /// <summary>
-/// Контекст SQLite для настроек юзербота и журнала рассылок.
+/// Контекст PostgreSQL для настроек юзербота и журнала рассылок.
 /// </summary>
 public sealed class AppDbContext : DbContext
 {
@@ -29,6 +29,8 @@ public sealed class AppDbContext : DbContext
             entity.Property(e => e.Title).HasMaxLength(256).IsRequired();
             entity.Property(e => e.SlowModeSeconds).HasDefaultValue(600);
             entity.Property(e => e.IsActive).HasDefaultValue(true);
+            entity.Property(e => e.PostsPerDay).HasDefaultValue(5);
+            entity.Property(e => e.PostsTodayCount).HasDefaultValue(0);
         });
 
         modelBuilder.Entity<AdvertisingTemplate>(entity =>

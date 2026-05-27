@@ -1,4 +1,3 @@
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -64,7 +63,7 @@ builder.Services
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<IAiTextService, AiTextService>();
 builder.Services.AddDbContextFactory<AppDbContext>(options =>
-    options.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection")));
+    options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
 builder.Services.AddSingleton<TelegramClientManager>();
 builder.Services.AddSingleton<TelegramCommandProcessor>();
 builder.Services.AddSingleton<TelegramUpdateRouter>();
@@ -74,32 +73,13 @@ using var host = builder.Build();
 
 await using (var scope = host.Services.CreateAsyncScope())
 {
-    var config = scope.ServiceProvider.GetRequiredService<IConfiguration>();
-    var connString = config.GetConnectionString("DefaultConnection");
     var dbFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<AppDbContext>>();
 
     try
     {
-        if (!string.IsNullOrWhiteSpace(connString))
-        {
-            var builderSqlite = new SqliteConnectionStringBuilder(connString);
-            if (!string.IsNullOrWhiteSpace(builderSqlite.DataSource) && !builderSqlite.DataSource.Equals(":memory:", StringComparison.OrdinalIgnoreCase))
-            {
-                var fullPath = Path.GetFullPath(builderSqlite.DataSource);
-                var directory = Path.GetDirectoryName(fullPath);
-                if (!string.IsNullOrEmpty(directory))
-                {
-                    Directory.CreateDirectory(directory);
-                }
-                Console.WriteLine($"База данных SQLite: {fullPath}");
-            }
-        }
-
         await using var db = await dbFactory.CreateDbContextAsync();
-        var connection = db.Database.GetDbConnection();
-        await connection.OpenAsync();
         await db.Database.MigrateAsync();
-        await connection.CloseAsync();
+        Console.WriteLine("Миграции БД применены успешно.");
     }
     catch (Exception ex)
     {
@@ -107,15 +87,7 @@ await using (var scope = host.Services.CreateAsyncScope())
         Console.Error.WriteLine("❌ Ошибка при выполнении миграций БД:");
         Console.Error.WriteLine($"   {ex.Message}");
         Console.Error.WriteLine();
-        Console.Error.WriteLine("Диагностика окружения (ConnectionStrings):");
-        foreach (var entry in Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>())
-        {
-            var key = entry.Key.ToString() ?? "";
-            if (key.StartsWith("ConnectionStrings__", StringComparison.OrdinalIgnoreCase))
-            {
-                Console.Error.WriteLine($"  {key} = {SanitizeConnectionString(entry.Value?.ToString())}");
-            }
-        }
+        Console.Error.WriteLine("Проверьте переменную ConnectionStrings__DefaultConnection.");
         throw;
     }
 }
@@ -138,25 +110,26 @@ try
     Console.WriteLine("  /logs - последние логи");
     Console.WriteLine("  /help - справка по командам");
 
+    // Минимальный HTTP-сервер для Render (требует открытый порт)
+    var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
+    var httpListener = new System.Net.HttpListener();
+    httpListener.Prefixes.Add($"http://*:{port}/");
+    httpListener.Start();
+    _ = Task.Run(async () =>
+    {
+        while (httpListener.IsListening)
+        {
+            var ctx = await httpListener.GetContextAsync();
+            ctx.Response.StatusCode = 200;
+            await ctx.Response.OutputStream.WriteAsync("OK"u8.ToArray());
+            ctx.Response.Close();
+        }
+    });
+    Console.WriteLine($"HTTP listener запущен на порту {port}");
+
     if (Console.IsInputRedirected)
     {
         Console.WriteLine("Планировщик рассылки активен. Ожидание сигнала завершения...");
-        // Минимальный HTTP-сервер для Render (он требует открытый порт)
-var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
-var httpListener = new System.Net.HttpListener();
-httpListener.Prefixes.Add($"http://*:{port}/");
-httpListener.Start();
-_ = Task.Run(async () =>
-{
-    while (httpListener.IsListening)
-    {
-        var ctx = await httpListener.GetContextAsync();
-        ctx.Response.StatusCode = 200;
-        await ctx.Response.OutputStream.WriteAsync("OK"u8.ToArray());
-        ctx.Response.Close();
-    }
-});
-Console.WriteLine($"HTTP listener started on port {port}");
         await host.WaitForShutdownAsync();
     }
     else
@@ -195,55 +168,8 @@ static void PrintTelegramConfigHelp(TelegramAppSettings? settings, string? error
     Console.Error.WriteLine("Ошибка конфигурации Telegram API:");
     Console.Error.WriteLine($"  => {error}");
     Console.Error.WriteLine();
-    Console.Error.WriteLine("Текущие загруженные значения (проверьте правильность имен переменных окружения):");
     Console.Error.WriteLine($"  Telegram:ApiId   = {(settings?.ApiId != 0 ? settings?.ApiId : "(не задано)")}");
     Console.Error.WriteLine($"  Telegram:ApiHash = {SanitizeHash(settings?.ApiHash)}");
-    Console.Error.WriteLine();
-    Console.Error.WriteLine("Обнаруженные переменные окружения (с префиксом или известные нам):");
-    var foundAny = false;
-    var knownKeys = new HashSet<string>(
-        new[] { "ApiId", "ApiHash", "PhoneNumber", "Password2Fa", "SessionPath", "NeuralApiToken", "AiModelName", "AiBaseUrl" },
-        StringComparer.OrdinalIgnoreCase);
-
-    foreach (var entry in Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>())
-    {
-        var key = entry.Key.ToString() ?? "";
-        if (key.StartsWith("Telegram__", StringComparison.OrdinalIgnoreCase) ||
-            key.StartsWith("Ai__",       StringComparison.OrdinalIgnoreCase) ||
-            key.StartsWith("ConnectionStrings__", StringComparison.OrdinalIgnoreCase) ||
-            knownKeys.Contains(key))
-        {
-            var val = entry.Value?.ToString();
-            var masked = key.Contains("Hash",  StringComparison.OrdinalIgnoreCase) ||
-                         key.Contains("Key",   StringComparison.OrdinalIgnoreCase) ||
-                         key.Contains("Pass",  StringComparison.OrdinalIgnoreCase) ||
-                         key.Contains("Token", StringComparison.OrdinalIgnoreCase)
-                         ? SanitizeHash(val) : val;
-
-            if (key.StartsWith("ConnectionStrings__", StringComparison.OrdinalIgnoreCase))
-                masked = SanitizeConnectionString(val);
-            Console.Error.WriteLine($"  {key} = {masked}");
-            foundAny = true;
-        }
-    }
-
-    if (!foundAny) Console.Error.WriteLine("  (переменные не найдены)");
-    Console.Error.WriteLine();
-    Console.Error.WriteLine("Инструкция по настройке:");
-    Console.Error.WriteLine("1) Откройте https://my.telegram.org/apps и создайте приложение.");
-    Console.Error.WriteLine("2) Укажите api_id и api_hash в переменных окружения на Render:");
-    Console.Error.WriteLine("   (Используйте двойное подчеркивание '__' для вложенных параметров)");
-    Console.Error.WriteLine();
-    Console.Error.WriteLine("   Telegram__ApiId   = 12345678");
-    Console.Error.WriteLine("   Telegram__ApiHash = ваш_api_hash");
-    Console.Error.WriteLine();
-    Console.Error.WriteLine("Или в файле appsettings.json:");
-    Console.Error.WriteLine("   {");
-    Console.Error.WriteLine("     \"Telegram\": {");
-    Console.Error.WriteLine("       \"ApiId\": 12345678,");
-    Console.Error.WriteLine("       \"ApiHash\": \"ваш_api_hash\"");
-    Console.Error.WriteLine("     }");
-    Console.Error.WriteLine("   }");
 }
 
 static string SanitizeHash(string? hash)
@@ -251,20 +177,4 @@ static string SanitizeHash(string? hash)
     if (string.IsNullOrWhiteSpace(hash)) return "(не задано)";
     if (hash.Length <= 4) return "****";
     return $"{hash[0]}...{hash[^1]} ({hash.Length} симв.)";
-}
-
-static string SanitizeConnectionString(string? connectionString)
-{
-    if (string.IsNullOrWhiteSpace(connectionString)) return "(не задано)";
-    try
-    {
-        var builder = new SqliteConnectionStringBuilder(connectionString);
-        var dataSource = builder.DataSource;
-        if (string.IsNullOrWhiteSpace(dataSource)) return "****";
-        return $"Data Source={dataSource}; (другие параметры скрыты)";
-    }
-    catch
-    {
-        return SanitizeHash(connectionString);
-    }
 }
