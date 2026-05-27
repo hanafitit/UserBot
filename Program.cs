@@ -15,8 +15,30 @@ WTelegram.Helpers.Log = (_, _) => { };
 
 var builder = Host.CreateApplicationBuilder(args);
 
-// Гарантируем подгрузку переменных окружения (обычно включено по умолчанию в CreateApplicationBuilder, но добавим явно)
+// Гарантируем подгрузку переменных окружения
 builder.Configuration.AddEnvironmentVariables();
+
+// Авто-маппинг "голых" переменных (без префикса) для удобства деплоя на Render
+var fallbackConfigs = new Dictionary<string, string>
+{
+    { "ApiId", "Telegram:ApiId" },
+    { "ApiHash", "Telegram:ApiHash" },
+    { "PhoneNumber", "Telegram:PhoneNumber" },
+    { "Password2Fa", "Telegram:Password2Fa" },
+    { "SessionPath", "Telegram:SessionPath" },
+    { "NeuralApiToken", "Ai:AiApiKey" }, // Маппинг для NeuralApiToken -> AiApiKey
+    { "AiModelName", "Ai:AiModelName" },
+    { "AiBaseUrl", "Ai:AiBaseUrl" }
+};
+
+foreach (var fallback in fallbackConfigs)
+{
+    var envValue = Environment.GetEnvironmentVariable(fallback.Key);
+    if (!string.IsNullOrWhiteSpace(envValue) && string.IsNullOrWhiteSpace(builder.Configuration[fallback.Value]))
+    {
+        builder.Configuration[fallback.Value] = envValue;
+    }
+}
 
 var telegramSettings = new TelegramAppSettings();
 builder.Configuration.GetSection(TelegramAppSettings.SectionName).Bind(telegramSettings);
@@ -146,18 +168,22 @@ static void PrintTelegramConfigHelp(TelegramAppSettings? settings, string? error
     Console.Error.WriteLine($"  Telegram:ApiHash = {SanitizeHash(settings?.ApiHash)}");
     Console.Error.WriteLine();
 
-    Console.Error.WriteLine("Обнаруженные переменные окружения (с префиксом Telegram__ или Ai__):");
+    Console.Error.WriteLine("Обнаруженные переменные окружения (с префиксом или известные нам):");
     var foundAny = false;
+    var knownKeys = new HashSet<string>(new[] { "ApiId", "ApiHash", "PhoneNumber", "Password2Fa", "SessionPath", "NeuralApiToken", "AiModelName", "AiBaseUrl" }, StringComparer.OrdinalIgnoreCase);
+
     foreach (var entry in Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>())
     {
         var key = entry.Key.ToString() ?? "";
         if (key.StartsWith("Telegram__", StringComparison.OrdinalIgnoreCase) ||
-            key.StartsWith("Ai__", StringComparison.OrdinalIgnoreCase))
+            key.StartsWith("Ai__", StringComparison.OrdinalIgnoreCase) ||
+            knownKeys.Contains(key))
         {
             var val = entry.Value?.ToString();
             var masked = key.Contains("Hash", StringComparison.OrdinalIgnoreCase) ||
                          key.Contains("Key", StringComparison.OrdinalIgnoreCase) ||
-                         key.Contains("Pass", StringComparison.OrdinalIgnoreCase)
+                         key.Contains("Pass", StringComparison.OrdinalIgnoreCase) ||
+                         key.Contains("Token", StringComparison.OrdinalIgnoreCase)
                          ? SanitizeHash(val) : val;
             Console.Error.WriteLine($"  {key} = {masked}");
             foundAny = true;
