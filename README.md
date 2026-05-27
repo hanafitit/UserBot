@@ -145,11 +145,11 @@ SQLite с таблицами:
 
 1. Создайте новый Web Service на Render
 2. Используйте этот репозиторий
-3. Переменные окружения:
+3. Переменные окружения (используйте `__` для вложенности):
 ```
 Telegram__ApiId=12345678
 Telegram__ApiHash=your_hash
-Telegram__PhoneNumber=
+Telegram__PhoneNumber=+7...
 Ai__AiApiKey=sk-...
 Ai__AiModelName=gpt-3.5-turbo
 Ai__AiBaseUrl=https://api.openai.com/v1/
@@ -157,7 +157,9 @@ ConnectionStrings__DefaultConnection=Data Source=userbot.db
 ```
 
 4. Build command: `dotnet build`
-5. Start command: `dotnet TestApp.dll`
+5. Start command: `cd bin/Debug/net8.0 && dotnet TestApp.dll` (или путь к Release)
+
+> **Важно:** Для первого входа требуется ввод SMS-кода, что невозможно в логах Render. См. [RENDER_SETUP.md](RENDER_SETUP.md) для решения.
 
 ## 🔐 Безопасность
 

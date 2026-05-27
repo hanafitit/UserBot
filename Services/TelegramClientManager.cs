@@ -120,6 +120,13 @@ public sealed class TelegramClientManager : IAsyncDisposable
                 return GetPhoneNumber();
 
             case "verification_code":
+                if (Console.IsInputRedirected)
+                {
+                    throw new InvalidOperationException(
+                        "Требуется код подтверждения (SMS), но приложение запущено в неинтерактивном режиме (например, на Render). " +
+                        "Пожалуйста, сначала запустите приложение локально, чтобы создать файл сессии, и загрузите его, " +
+                        "либо обеспечьте постоянное хранение файла сессии.");
+                }
                 Console.WriteLine();
                 Console.Write("Код из SMS/Telegram: ");
                 return Console.ReadLine()?.Trim();
@@ -127,8 +134,14 @@ public sealed class TelegramClientManager : IAsyncDisposable
             case "password":
                 if (!string.IsNullOrWhiteSpace(_settings.Password2Fa))
                 {
-                    _logger.LogInformation("Автовход: пароль 2FA взят из appsettings.json");
+                    _logger.LogInformation("Автовход: пароль 2FA взят из конфигурации");
                     return _settings.Password2Fa;
+                }
+
+                if (Console.IsInputRedirected)
+                {
+                    _logger.LogWarning("Пароль 2FA не задан в конфигурации, а ввод перенаправлен. Попытка входа без пароля.");
+                    return null;
                 }
 
                 Console.WriteLine();
@@ -137,10 +150,12 @@ public sealed class TelegramClientManager : IAsyncDisposable
                 return string.IsNullOrWhiteSpace(password) ? null : password.Trim();
 
             case "first_name":
+                if (Console.IsInputRedirected) return "User";
                 Console.Write("Имя (регистрация нового аккаунта): ");
                 return Console.ReadLine()?.Trim() ?? "User";
 
             case "last_name":
+                if (Console.IsInputRedirected) return "";
                 Console.Write("Фамилия (регистрация нового аккаунта): ");
                 return Console.ReadLine()?.Trim() ?? "";
 
@@ -171,8 +186,15 @@ public sealed class TelegramClientManager : IAsyncDisposable
         if (!string.IsNullOrWhiteSpace(_settings.PhoneNumber))
         {
             _phoneNumber = NormalizePhoneNumber(_settings.PhoneNumber);
-            _logger.LogInformation("Автовход: номер взят из appsettings.json");
+            _logger.LogInformation("Автовход: номер взят из конфигурации");
             return _phoneNumber;
+        }
+
+        if (Console.IsInputRedirected)
+        {
+            throw new InvalidOperationException(
+                "Номер телефона не задан в конфигурации (Telegram:PhoneNumber), а ввод перенаправлен. " +
+                "Укажите номер телефона в переменных окружения или appsettings.json.");
         }
 
         Console.WriteLine();
