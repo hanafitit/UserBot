@@ -117,7 +117,7 @@ static void PrintTelegramConfigHelp(TelegramAppSettings? settings, string? error
     Console.Error.WriteLine($"  => {error}");
     Console.Error.WriteLine();
     Console.Error.WriteLine("Текущие загруженные значения (проверьте правильность имен переменных окружения):");
-    Console.Error.WriteLine($"  Telegram:ApiId   = {(settings?.ApiId != 0 ? settings?.ApiId : "(не задано)")}");
+    Console.Error.WriteLine($"  Telegram:ApiId   = {(settings?.ApiId > 0 ? settings.ApiId.ToString() : "(не задано)")}");
     Console.Error.WriteLine($"  Telegram:ApiHash = {SanitizeHash(settings?.ApiHash)}");
     Console.Error.WriteLine();
     Console.Error.WriteLine("Инструкция по настройке:");
