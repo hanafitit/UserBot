@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using TestApp.Data;
 using TestApp.Data.Models;
+using TL;
 
 namespace TestApp.Services;
 
@@ -11,13 +12,16 @@ namespace TestApp.Services;
 public sealed class TelegramCommandProcessor
 {
     private readonly IDbContextFactory<AppDbContext> _dbContextFactory;
+    private readonly TelegramClientManager _clientManager;
     private readonly ILogger<TelegramCommandProcessor> _logger;
 
     public TelegramCommandProcessor(
         IDbContextFactory<AppDbContext> dbContextFactory,
+        TelegramClientManager clientManager,
         ILogger<TelegramCommandProcessor> logger)
     {
         _dbContextFactory = dbContextFactory;
+        _clientManager = clientManager;
         _logger = logger;
     }
 
@@ -46,30 +50,47 @@ public sealed class TelegramCommandProcessor
     }
 
     /// <summary>
-    /// Добавляет целевой чат: /add_chat {ID} {Название} [{ПостовВДень}]
+    /// Добавляет целевой чат: /add_chat {ID или @username} [{Название}] [{ПостовВДень}]
     /// </summary>
     private async Task<string> AddChatAsync(string arguments, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(arguments))
-            return "Формат: /add_chat {ID_чата} {Название} [кол-во_в_день]";
+            return "Формат: /add_chat {ID или @username} [Название] [кол-во_в_день]";
 
         var parts = arguments.Split(' ', 3, StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length < 2)
-            return "Формат: /add_chat {ID_чата} {Название} [кол-во_в_день]";
+        var identifier = parts[0];
 
-        if (!long.TryParse(parts[0], out var chatId))
-            return "ID чата должен быть числом (например: -1001234567890).";
+        var (chatId, resolvedTitle) = await ResolveIdentifierAsync(identifier, cancellationToken);
+        if (chatId == 0)
+            return "❌ Не удалось найти чат или пользователя по указанному ID/юзернейму.";
 
-        var title = parts[1].Trim();
-        if (string.IsNullOrWhiteSpace(title))
-            return "Укажите название чата после ID.";
+        string title;
+        int postsPerDay = 5;
 
-        int postsPerDay = 5; // По умолчанию 5 постов в день
-        if (parts.Length >= 3)
+        if (parts.Length >= 2)
         {
-            if (!int.TryParse(parts[2], out postsPerDay) || postsPerDay < 1)
-                return "Кол-во постов должно быть числом >= 1. Например: 5 или 10";
+            // Если второй аргумент — число, значит это PostsPerDay, а название пропущено
+            if (int.TryParse(parts[1], out var p1) && p1 >= 1)
+            {
+                postsPerDay = p1;
+                title = resolvedTitle ?? identifier;
+            }
+            else
+            {
+                title = parts[1].Trim();
+                if (parts.Length >= 3 && int.TryParse(parts[2], out var p2) && p2 >= 1)
+                {
+                    postsPerDay = p2;
+                }
+            }
         }
+        else
+        {
+            title = resolvedTitle ?? identifier;
+        }
+
+        if (string.IsNullOrWhiteSpace(title))
+            return "Укажите название чата или используйте юзернейм для авто-определения.";
 
         await using var db = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
 
@@ -92,15 +113,16 @@ public sealed class TelegramCommandProcessor
     }
 
     /// <summary>
-    /// Удаляет чат из рассылки: /del_chat {ID}
+    /// Удаляет чат из рассылки: /del_chat {ID или @username}
     /// </summary>
     private async Task<string> DelChatAsync(string arguments, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(arguments))
-            return "Формат: /del_chat {ID_чата}";
+            return "Формат: /del_chat {ID_чата или @username}";
 
-        if (!long.TryParse(arguments.Trim(), out var chatId))
-            return "ID чата должен быть числом (например: -1001234567890).";
+        var (chatId, _) = await ResolveIdentifierAsync(arguments.Trim(), cancellationToken);
+        if (chatId == 0)
+            return "❌ Не удалось разрешить ID/юзернейм чата.";
 
         await using var db = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
 
@@ -113,6 +135,34 @@ public sealed class TelegramCommandProcessor
         _logger.LogInformation("Удалён целевой чат {ChatId} ({Title})", chatId, chat.Title);
 
         return $"❌ Чат {chatId} успешно удален из списка рассылки.";
+    }
+
+    private async Task<(long Id, string? Title)> ResolveIdentifierAsync(string identifier, CancellationToken ct)
+    {
+        if (long.TryParse(identifier, out var id))
+            return (id, null);
+
+        var username = identifier.TrimStart('@');
+        try
+        {
+            var resolved = await _clientManager.Client.Contacts_ResolveUsername(username);
+            return resolved.peer switch
+            {
+                PeerUser pu when resolved.users.TryGetValue(pu.user_id, out var user) =>
+                    (user.id, (user.first_name + " " + user.last_name).Trim()),
+                PeerChat pc when resolved.chats.TryGetValue(pc.chat_id, out var chatBase) && chatBase is Chat chat =>
+                    (chat.id, chat.title),
+                PeerChannel pch when resolved.chats.TryGetValue(pch.channel_id, out var chatBase) && chatBase is Channel channel =>
+                    (-1_000_000_000_000L - channel.id, channel.title),
+                _ => (0, null)
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Ошибка при разрешении юзернейма {Username}", username);
+        }
+
+        return (0, null);
     }
 
     /// <summary>
@@ -198,11 +248,12 @@ public sealed class TelegramCommandProcessor
         return """
             📚 СПРАВКА ПО КОМАНДАМ
             
-            /add_chat {ID} {название} [N]
+            /add_chat {ID/username} [название] [N]
               Добавить чат в рассылку. N — макс постов в день (по умолчанию 5)
               Пример: /add_chat -1001234567890 MyGroup 3
+              Пример: /add_chat @my_group
             
-            /del_chat {ID}
+            /del_chat {ID/username}
               Удалить чат из рассылки
             
             /set_text {текст}

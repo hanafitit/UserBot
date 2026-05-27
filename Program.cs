@@ -103,8 +103,8 @@ try
     Console.WriteLine();
     Console.WriteLine($"Сессия сохранена. Пользователь: {user.first_name} {user.last_name} (@{user.username ?? "—"}, id: {user.id})");
     Console.WriteLine("Команды в «Избранное»:");
-    Console.WriteLine("  /add_chat {ID} {название} [кол-во] - добавить чат");
-    Console.WriteLine("  /del_chat {ID} - удалить чат");
+    Console.WriteLine("  /add_chat {ID/username} [название] [кол-во] - добавить чат");
+    Console.WriteLine("  /del_chat {ID/username} - удалить чат");
     Console.WriteLine("  /set_text {текст} - установить объявление");
     Console.WriteLine("  /status - статус рассылки");
     Console.WriteLine("  /logs - последние логи");
