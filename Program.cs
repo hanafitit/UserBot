@@ -34,9 +34,14 @@ var fallbackConfigs = new Dictionary<string, string>
 foreach (var fallback in fallbackConfigs)
 {
     var envValue = Environment.GetEnvironmentVariable(fallback.Key);
-    if (!string.IsNullOrWhiteSpace(envValue) && string.IsNullOrWhiteSpace(builder.Configuration[fallback.Value]))
+    if (!string.IsNullOrWhiteSpace(envValue))
     {
-        builder.Configuration[fallback.Value] = envValue;
+        var currentValue = builder.Configuration[fallback.Value];
+        // Перезаписываем, если значение в конфиге отсутствует, пустое или равно "0" (для ApiId)
+        if (string.IsNullOrWhiteSpace(currentValue) || currentValue == "0")
+        {
+            builder.Configuration[fallback.Value] = envValue;
+        }
     }
 }
 
