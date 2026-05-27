@@ -9,14 +9,39 @@ using TestApp.Workers;
 using TL;
 using WTelegram;
 
-// Отключаем подробный MTProto-лог в консоль (Receiving Updates и т.д.).
 WTelegram.Helpers.Log = (_, _) => { };
 
 var builder = Host.CreateApplicationBuilder(args);
 
-var telegramSettings = builder.Configuration
-    .GetSection(TelegramAppSettings.SectionName)
-    .Get<TelegramAppSettings>();
+// Гарантируем подгрузку переменных окружения
+builder.Configuration.AddEnvironmentVariables();
+
+// Авто-маппинг "голых" переменных (без префикса) для удобства деплоя на Render
+var fallbackConfigs = new Dictionary<string, string>
+{
+    { "ApiId",          "Telegram:ApiId" },
+    { "ApiHash",        "Telegram:ApiHash" },
+    { "PhoneNumber",    "Telegram:PhoneNumber" },
+    { "Password2Fa",    "Telegram:Password2Fa" },
+    { "SessionPath",    "Telegram:SessionPath" },
+    { "NeuralApiToken", "Ai:AiApiKey" },
+    { "AiModelName",    "Ai:AiModelName" },
+    { "AiBaseUrl",      "Ai:AiBaseUrl" }
+};
+
+foreach (var fallback in fallbackConfigs)
+{
+    var envValue = Environment.GetEnvironmentVariable(fallback.Key);
+    if (!string.IsNullOrWhiteSpace(envValue))
+    {
+        var currentValue = builder.Configuration[fallback.Value];
+        if (string.IsNullOrWhiteSpace(currentValue) || currentValue == "0")
+            builder.Configuration[fallback.Value] = envValue;
+    }
+}
+
+var telegramSettings = new TelegramAppSettings();
+builder.Configuration.GetSection(TelegramAppSettings.SectionName).Bind(telegramSettings);
 
 var (isValid, errorMessage) = ValidateTelegramConfig(telegramSettings);
 if (!isValid)
@@ -37,10 +62,8 @@ builder.Services
 
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<IAiTextService, AiTextService>();
-
 builder.Services.AddDbContextFactory<AppDbContext>(options =>
     options.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection")));
-
 builder.Services.AddSingleton<TelegramClientManager>();
 builder.Services.AddSingleton<TelegramCommandProcessor>();
 builder.Services.AddSingleton<TelegramUpdateRouter>();
@@ -55,14 +78,11 @@ await using (var scope = host.Services.CreateAsyncScope())
 }
 
 await using var telegram = host.Services.GetRequiredService<TelegramClientManager>();
-
 try
 {
     var user = await telegram.LoginAsync();
-
     var updateRouter = host.Services.GetRequiredService<TelegramUpdateRouter>();
     updateRouter.Initialize();
-
     await host.StartAsync();
 
     Console.WriteLine();
@@ -119,6 +139,32 @@ static void PrintTelegramConfigHelp(TelegramAppSettings? settings, string? error
     Console.Error.WriteLine("Текущие загруженные значения (проверьте правильность имен переменных окружения):");
     Console.Error.WriteLine($"  Telegram:ApiId   = {(settings?.ApiId != 0 ? settings?.ApiId : "(не задано)")}");
     Console.Error.WriteLine($"  Telegram:ApiHash = {SanitizeHash(settings?.ApiHash)}");
+    Console.Error.WriteLine();
+    Console.Error.WriteLine("Обнаруженные переменные окружения (с префиксом или известные нам):");
+    var foundAny = false;
+    var knownKeys = new HashSet<string>(
+        new[] { "ApiId", "ApiHash", "PhoneNumber", "Password2Fa", "SessionPath", "NeuralApiToken", "AiModelName", "AiBaseUrl" },
+        StringComparer.OrdinalIgnoreCase);
+
+    foreach (var entry in Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>())
+    {
+        var key = entry.Key.ToString() ?? "";
+        if (key.StartsWith("Telegram__", StringComparison.OrdinalIgnoreCase) ||
+            key.StartsWith("Ai__",       StringComparison.OrdinalIgnoreCase) ||
+            knownKeys.Contains(key))
+        {
+            var val = entry.Value?.ToString();
+            var masked = key.Contains("Hash",  StringComparison.OrdinalIgnoreCase) ||
+                         key.Contains("Key",   StringComparison.OrdinalIgnoreCase) ||
+                         key.Contains("Pass",  StringComparison.OrdinalIgnoreCase) ||
+                         key.Contains("Token", StringComparison.OrdinalIgnoreCase)
+                         ? SanitizeHash(val) : val;
+            Console.Error.WriteLine($"  {key} = {masked}");
+            foundAny = true;
+        }
+    }
+
+    if (!foundAny) Console.Error.WriteLine("  (переменные не найдены)");
     Console.Error.WriteLine();
     Console.Error.WriteLine("Инструкция по настройке:");
     Console.Error.WriteLine("1) Откройте https://my.telegram.org/apps и создайте приложение.");
