@@ -11,33 +11,31 @@ using WTelegram;
 
 WTelegram.Helpers.Log = (_, _) => { };
 
+// ── HTTP listener поднимаем ПЕРВЫМ делом, чтобы Render увидел порт ──
+var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
+var httpListener = new System.Net.HttpListener();
+httpListener.Prefixes.Add($"http://*:{port}/");
+httpListener.Start();
+_ = Task.Run(async () =>
+{
+    while (httpListener.IsListening)
+    {
+        try
+        {
+            var ctx = await httpListener.GetContextAsync();
+            ctx.Response.StatusCode = 200;
+            await ctx.Response.OutputStream.WriteAsync("OK"u8.ToArray());
+            ctx.Response.Close();
+        }
+        catch { /* listener остановлен */ }
+    }
+});
+Console.WriteLine($"HTTP listener запущен на порту {port}");
+
 var builder = Host.CreateApplicationBuilder(args);
 
-// Гарантируем подгрузку переменных окружения
 builder.Configuration.AddEnvironmentVariables();
-// Самопинг каждые 10 минут чтобы Render не усыплял сервис
-var renderUrl = Environment.GetEnvironmentVariable("RENDER_EXTERNAL_URL");
-if (!string.IsNullOrWhiteSpace(renderUrl))
-{
-    _ = Task.Run(async () =>
-    {
-        using var pingClient = new HttpClient();
-        while (true)
-        {
-            await Task.Delay(TimeSpan.FromMinutes(10));
-            try
-            {
-                await pingClient.GetAsync(renderUrl);
-                Console.WriteLine($"Self-ping OK: {renderUrl}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Self-ping failed: {ex.Message}");
-            }
-        }
-    });
-    Console.WriteLine($"Self-ping запущен → {renderUrl}");
-}
+
 // Авто-маппинг "голых" переменных (без префикса) для удобства деплоя на Render
 var fallbackConfigs = new Dictionary<string, string>
 {
@@ -96,7 +94,6 @@ using var host = builder.Build();
 await using (var scope = host.Services.CreateAsyncScope())
 {
     var dbFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<AppDbContext>>();
-
     try
     {
         await using var db = await dbFactory.CreateDbContextAsync();
@@ -105,10 +102,7 @@ await using (var scope = host.Services.CreateAsyncScope())
     }
     catch (Exception ex)
     {
-        Console.Error.WriteLine();
-        Console.Error.WriteLine("❌ Ошибка при выполнении миграций БД:");
-        Console.Error.WriteLine($"   {ex.Message}");
-        Console.Error.WriteLine();
+        Console.Error.WriteLine($"❌ Ошибка при выполнении миграций БД: {ex.Message}");
         Console.Error.WriteLine("Проверьте переменную ConnectionStrings__DefaultConnection.");
         throw;
     }
@@ -123,43 +117,43 @@ try
     await host.StartAsync();
 
     Console.WriteLine();
-    Console.WriteLine($"Сессия сохранена. Пользователь: {user.first_name} {user.last_name} (@{user.username ?? "—"}, id: {user.id})");
+    Console.WriteLine($"Пользователь: {user.first_name} {user.last_name} (@{user.username ?? "—"}, id: {user.id})");
     Console.WriteLine("Команды в «Избранное»:");
-    Console.WriteLine("  /add_chat {ID} {название} [кол-во] - добавить чат");
+    Console.WriteLine("  /add_chat {ID} {название} [кол-во] - добавить чат по ID");
+    Console.WriteLine("  /add_chat @username [кол-во] - добавить чат по username");
+    Console.WriteLine("  /add_chat https://t.me/username [кол-во] - добавить чат по ссылке");
     Console.WriteLine("  /del_chat {ID} - удалить чат");
     Console.WriteLine("  /set_text {текст} - установить объявление");
     Console.WriteLine("  /status - статус рассылки");
     Console.WriteLine("  /logs - последние логи");
     Console.WriteLine("  /help - справка по командам");
 
-    // Минимальный HTTP-сервер для Render (требует открытый порт)
-    var port = Environment.GetEnvironmentVariable("PORT") ?? "10000";
-    var httpListener = new System.Net.HttpListener();
-    httpListener.Prefixes.Add($"http://*:{port}/");
-    httpListener.Start();
-    _ = Task.Run(async () =>
+    // Самопинг каждые 10 минут чтобы Render не усыплял сервис
+    var renderUrl = Environment.GetEnvironmentVariable("RENDER_EXTERNAL_URL");
+    if (!string.IsNullOrWhiteSpace(renderUrl))
     {
-        while (httpListener.IsListening)
+        _ = Task.Run(async () =>
         {
-            var ctx = await httpListener.GetContextAsync();
-            ctx.Response.StatusCode = 200;
-            await ctx.Response.OutputStream.WriteAsync("OK"u8.ToArray());
-            ctx.Response.Close();
-        }
-    });
-    Console.WriteLine($"HTTP listener запущен на порту {port}");
-
-    if (Console.IsInputRedirected)
-    {
-        Console.WriteLine("Планировщик рассылки активен. Ожидание сигнала завершения...");
-        await host.WaitForShutdownAsync();
+            using var pingClient = new HttpClient();
+            while (true)
+            {
+                await Task.Delay(TimeSpan.FromMinutes(10));
+                try
+                {
+                    await pingClient.GetAsync(renderUrl);
+                    Console.WriteLine($"Self-ping OK: {renderUrl}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Self-ping failed: {ex.Message}");
+                }
+            }
+        });
+        Console.WriteLine($"Self-ping запущен → {renderUrl}");
     }
-    else
-    {
-        Console.WriteLine("Планировщик рассылки активен. Нажмите Enter для выхода…");
-        await Task.WhenAny(host.WaitForShutdownAsync(), Task.Run(Console.ReadLine));
-    }
 
+    Console.WriteLine("Планировщик рассылки активен. Ожидание сигнала завершения...");
+    await host.WaitForShutdownAsync();
     await host.StopAsync();
 }
 catch (TelegramFloodWaitException ex)
@@ -189,7 +183,6 @@ static void PrintTelegramConfigHelp(TelegramAppSettings? settings, string? error
     Console.Error.WriteLine();
     Console.Error.WriteLine("Ошибка конфигурации Telegram API:");
     Console.Error.WriteLine($"  => {error}");
-    Console.Error.WriteLine();
     Console.Error.WriteLine($"  Telegram:ApiId   = {(settings?.ApiId != 0 ? settings?.ApiId : "(не задано)")}");
     Console.Error.WriteLine($"  Telegram:ApiHash = {SanitizeHash(settings?.ApiHash)}");
 }
