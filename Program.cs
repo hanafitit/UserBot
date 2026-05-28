@@ -15,7 +15,29 @@ var builder = Host.CreateApplicationBuilder(args);
 
 // Гарантируем подгрузку переменных окружения
 builder.Configuration.AddEnvironmentVariables();
-
+// Самопинг каждые 10 минут чтобы Render не усыплял сервис
+var renderUrl = Environment.GetEnvironmentVariable("RENDER_EXTERNAL_URL");
+if (!string.IsNullOrWhiteSpace(renderUrl))
+{
+    _ = Task.Run(async () =>
+    {
+        using var pingClient = new HttpClient();
+        while (true)
+        {
+            await Task.Delay(TimeSpan.FromMinutes(10));
+            try
+            {
+                await pingClient.GetAsync(renderUrl);
+                Console.WriteLine($"Self-ping OK: {renderUrl}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Self-ping failed: {ex.Message}");
+            }
+        }
+    });
+    Console.WriteLine($"Self-ping запущен → {renderUrl}");
+}
 // Авто-маппинг "голых" переменных (без префикса) для удобства деплоя на Render
 var fallbackConfigs = new Dictionary<string, string>
 {
