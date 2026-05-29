@@ -14,6 +14,14 @@ namespace TestApp.Workers;
 /// </summary>
 public sealed class AdvertisingScheduler : BackgroundService
 {
+    private enum SendResult
+    {
+        Success,
+        Banned,
+        Flood,
+        Error
+    }
+
     /// <summary>
     /// Основной интервал проверки (1 минута достаточно для нечастых отправок).
     /// </summary>
@@ -136,7 +144,7 @@ public sealed class AdvertisingScheduler : BackgroundService
             .Where(c => c.IsActive)
             .ToListAsync(cancellationToken);
 
-        var readyChat = activeChats
+        var readyChats = activeChats
             .Where(c => 
             {
                 // Проверка SlowMode
@@ -160,28 +168,46 @@ public sealed class AdvertisingScheduler : BackgroundService
                 return true;
             })
             .OrderBy(c => c.LastSentAt ?? DateTime.MinValue)
-            .FirstOrDefault();
+            .ToList();
 
-        if (readyChat is null)
+        if (!readyChats.Any())
         {
             _logger.LogDebug("Нет чатов, готовых к отправке.");
             return;
         }
 
-        await SendToChatAsync(db, readyChat, template.BaseText, cancellationToken);
+        var allChats = await _clientManager.Client.Messages_GetAllChats();
 
-        // После успешной отправки — установить случайный перерыв до следующей
-        SetRandomBreak();
+        foreach (var chat in readyChats)
+        {
+            var result = await SendToChatAsync(db, chat, template.BaseText, allChats, cancellationToken);
+
+            if (result == SendResult.Success)
+            {
+                // После успешной отправки — установить случайный перерыв до следующей
+                SetRandomBreak();
+                return;
+            }
+
+            if (result == SendResult.Flood)
+            {
+                return; // Глобальная пауза уже установлена в HandleFloodAsync
+            }
+
+            // Если Banned или Error — продолжаем цикл к следующему чату
+            _logger.LogDebug("Пробуем следующий чат после неудачи в {ChatId}.", chat.Id);
+        }
     }
 
     /// <summary>
     /// Отправляет текст в чат с имитацией набора и обновляет БД.
     /// Каждый 5-й чат получает уникализированный текст.
     /// </summary>
-    private async Task SendToChatAsync(
+    private async Task<SendResult> SendToChatAsync(
         AppDbContext db,
         TargetChat chat,
         string messageText,
+        Messages_Chats? allChats,
         CancellationToken cancellationToken)
     {
         var client = _clientManager.Client;
@@ -190,13 +216,16 @@ public sealed class AdvertisingScheduler : BackgroundService
 
         try
         {
-            var inputPeer = await ResolveInputPeerAsync(client, chat.Id, cancellationToken);
+            var inputPeer = ResolveInputPeer(allChats, chat.Id);
             if (inputPeer is null)
             {
                 WriteLog(db, chat.Id, sentAt, "Error",
                     $"Чат {chat.Id} не найден в списке диалогов Telegram. Убедитесь, что аккаунт состоит в группе.");
                 _logger.LogWarning("Не удалось разрешить peer для чата {ChatId} ({Title}).", chat.Id, chat.Title);
-                return;
+
+                chat.LastSentAt = sentAt;
+                await db.SaveChangesAsync(cancellationToken);
+                return SendResult.Error;
             }
 
             string finalText;
@@ -260,27 +289,43 @@ public sealed class AdvertisingScheduler : BackgroundService
 
             _logger.LogInformation("✅ Сообщение отправлено в «{Title}» ({ChatId}) — {PostToday}/{PostsLimit} в день.", 
                 chat.Title, chat.Id, chat.PostsTodayCount, chat.PostsPerDay);
+            return SendResult.Success;
         }
         catch (TelegramFloodWaitException ex)
         {
             await HandleFloodAsync(db, chat.Id, sentAt, ex.RetryAfterSeconds, ex.Message, cancellationToken);
+            return SendResult.Flood;
         }
         catch (RpcException ex) when (ex.Code == 420)
         {
             var waitSeconds = ex.X > 0 ? ex.X : 30;
             await HandleFloodAsync(db, chat.Id, sentAt, waitSeconds, ex.Message, cancellationToken);
+            return SendResult.Flood;
         }
         catch (RpcException ex)
         {
+            var isBan = ex.Message.Contains("USER_BANNED_IN_CHANNEL") || ex.Message.Contains("CHAT_WRITE_FORBIDDEN");
+
+            if (isBan)
+            {
+                chat.IsActive = false;
+                _logger.LogWarning("🚫 Чат {ChatId} ({Title}) деактивирован: {Error}", chat.Id, chat.Title, ex.Message);
+            }
+
+            chat.LastSentAt = sentAt;
             WriteLog(db, chat.Id, sentAt, "Error", $"[{ex.Code}] {ex.Message}");
             await db.SaveChangesAsync(cancellationToken);
             _logger.LogError(ex, "Ошибка Telegram при отправке в {ChatId}.", chat.Id);
+
+            return isBan ? SendResult.Banned : SendResult.Error;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            chat.LastSentAt = sentAt;
             WriteLog(db, chat.Id, sentAt, "Error", ex.Message);
             await db.SaveChangesAsync(cancellationToken);
             _logger.LogError(ex, "Ошибка при отправке в {ChatId}.", chat.Id);
+            return SendResult.Error;
         }
     }
 
@@ -358,12 +403,10 @@ public sealed class AdvertisingScheduler : BackgroundService
     /// <summary>
     /// Ищет чат в кэше Telegram по ID (в т.ч. формат -100… для супергрупп).
     /// </summary>
-    private static async Task<InputPeer?> ResolveInputPeerAsync(
-        Client client,
-        long chatId,
-        CancellationToken cancellationToken)
+    private static InputPeer? ResolveInputPeer(
+        Messages_Chats? chats,
+        long chatId)
     {
-        var chats = await client.Messages_GetAllChats();
         if (chats?.chats is null)
             return null;
 
