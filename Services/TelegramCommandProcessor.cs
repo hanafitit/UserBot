@@ -40,6 +40,7 @@ public sealed class TelegramCommandProcessor
         return command switch
         {
             "/add_chat" => await AddChatAsync(arguments, cancellationToken),
+            "/bulk_import" => await BulkImportAsync(arguments, cancellationToken),
             "/del_chat" => await DelChatAsync(arguments, cancellationToken),
             "/set_text" => await SetTextAsync(arguments, cancellationToken),
             "/status" => await GetStatusAsync(cancellationToken),
@@ -112,24 +113,6 @@ public sealed class TelegramCommandProcessor
     {
         var raw = parts[0];
 
-        // Парсим username из ссылки или @
-        string username;
-        if (raw.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-        {
-            // https://t.me/chatname или https://t.me/joinchat/... не поддерживаем (invite link)
-            var uri = raw.TrimEnd('/');
-            var lastSlash = uri.LastIndexOf('/');
-            username = lastSlash >= 0 ? uri[(lastSlash + 1)..] : uri;
-        }
-        else
-        {
-            // @username → убираем @
-            username = raw.TrimStart('@');
-        }
-
-        if (string.IsNullOrWhiteSpace(username))
-            return "Не удалось извлечь username из аргумента.";
-
         int postsPerDay = 5;
         if (parts.Length >= 2)
         {
@@ -137,12 +120,38 @@ public sealed class TelegramCommandProcessor
                 return "Кол-во постов должно быть числом >= 1.";
         }
 
+        var result = await ImportChatByUsernameInternalAsync(raw, postsPerDay, cancellationToken);
+        return result.Message;
+    }
+
+    private sealed record ImportResult(bool Success, string Message);
+
+    private async Task<ImportResult> ImportChatByUsernameInternalAsync(string rawUsernameOrLink, int postsPerDay, CancellationToken cancellationToken)
+    {
+        // Парсим username из ссылки или @
+        string username;
+        if (rawUsernameOrLink.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        {
+            // https://t.me/chatname или https://t.me/joinchat/... не поддерживаем (invite link)
+            var uri = rawUsernameOrLink.TrimEnd('/');
+            var lastSlash = uri.LastIndexOf('/');
+            username = lastSlash >= 0 ? uri[(lastSlash + 1)..] : uri;
+        }
+        else
+        {
+            // @username → убираем @
+            username = rawUsernameOrLink.TrimStart('@');
+        }
+
+        if (string.IsNullOrWhiteSpace(username))
+            return new ImportResult(false, "Не удалось извлечь username из аргумента.");
+
         // Резолвим через Telegram API
         try
         {
             var resolved = await _clientManager.Client.Contacts_ResolveUsername(username);
             if (resolved?.peer == null)
-                return $"Не удалось найти чат с username @{username}.";
+                return new ImportResult(false, $"Не удалось найти чат с username @{username}.");
 
             long chatId;
             string title;
@@ -168,16 +177,77 @@ public sealed class TelegramCommandProcessor
                     break;
 
                 default:
-                    return $"Неизвестный тип peer для @{username}.";
+                    return new ImportResult(false, $"Неизвестный тип peer для @{username}.");
             }
 
-            return await SaveChatAsync(chatId, title, postsPerDay, cancellationToken);
+            var saveResult = await SaveChatAsync(chatId, title, postsPerDay, cancellationToken);
+            return new ImportResult(true, saveResult);
         }
         catch (RpcException ex)
         {
             _logger.LogError(ex, "Ошибка при резолве username @{Username}", username);
-            return $"Ошибка Telegram [{ex.Code}]: {ex.Message}";
+            return new ImportResult(false, $"Ошибка Telegram [{ex.Code}]: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Массовый импорт чатов из файла Data/import_chats.txt
+    /// </summary>
+    private async Task<string> BulkImportAsync(string arguments, CancellationToken cancellationToken)
+    {
+        const string importFilePath = "Data/import_chats.txt";
+        if (!File.Exists(importFilePath))
+            return $"Файл {importFilePath} не найден. Сначала создайте его.";
+
+        int postsPerDay = 5;
+        if (!string.IsNullOrWhiteSpace(arguments))
+        {
+            if (!int.TryParse(arguments, out postsPerDay) || postsPerDay < 1)
+                return "Кол-во постов должно быть числом >= 1.";
+        }
+
+        var lines = await File.ReadAllLinesAsync(importFilePath, cancellationToken);
+        int successCount = 0;
+        int failCount = 0;
+        int alreadyExistsCount = 0;
+
+        var report = new System.Text.StringBuilder();
+        report.AppendLine($"🚀 Начинаю импорт {lines.Length} чатов...");
+
+        foreach (var line in lines)
+        {
+            var chatIdentifier = line.Trim();
+            if (string.IsNullOrWhiteSpace(chatIdentifier)) continue;
+
+            var result = await ImportChatByUsernameInternalAsync(chatIdentifier, postsPerDay, cancellationToken);
+            if (result.Success)
+            {
+                if (result.Message.Contains("уже есть в базе"))
+                {
+                    alreadyExistsCount++;
+                }
+                else
+                {
+                    successCount++;
+                }
+            }
+            else
+            {
+                failCount++;
+                _logger.LogWarning("Не удалось импортировать {Chat}: {Error}", chatIdentifier, result.Message);
+            }
+
+            // Небольшая задержка чтобы не спамить API Telegram при резолве
+            await Task.Delay(500, cancellationToken);
+        }
+
+        return $"""
+            📊 ИТОГИ ИМПОРТА:
+            ✅ Добавлено: {successCount}
+            Existing: {alreadyExistsCount}
+            ❌ Ошибок: {failCount}
+            Всего обработано: {lines.Length}
+            """;
     }
 
     /// <summary>
@@ -331,6 +401,9 @@ public sealed class TelegramCommandProcessor
 
             /logs
               Последние отправки и ошибки
+
+            /bulk_import [N]
+              Массовый импорт из Data/import_chats.txt (N постов/день, по умолчанию 5)
 
             /help
               Эта справка
