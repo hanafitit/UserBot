@@ -272,7 +272,15 @@ public sealed class AdvertisingScheduler : BackgroundService
         }
         catch (RpcException ex)
         {
-            WriteLog(db, chat.Id, sentAt, "Error", $"[{ex.Code}] {ex.Message}");
+            bool isPermanentError = ex.Message is "USER_BANNED_IN_CHANNEL" or "CHAT_WRITE_FORBIDDEN" or "CHAT_RESTRICTED" or "PEER_ID_INVALID";
+
+            if (isPermanentError)
+            {
+                chat.IsActive = false;
+                _logger.LogWarning("Чат {ChatId} ({Title}) деактивирован из-за ошибки: {Error}", chat.Id, chat.Title, ex.Message);
+            }
+
+            WriteLog(db, chat.Id, sentAt, isPermanentError ? "Banned" : "Error", $"[{ex.Code}] {ex.Message}");
             await db.SaveChangesAsync(cancellationToken);
             _logger.LogError(ex, "Ошибка Telegram при отправке в {ChatId}.", chat.Id);
         }
