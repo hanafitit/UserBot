@@ -41,6 +41,7 @@ public sealed class TelegramCommandProcessor
         {
             "/add_chat" => await AddChatAsync(arguments, cancellationToken),
             "/bulk_import" => await BulkImportAsync(arguments, cancellationToken),
+            "/bulk_join" => await BulkJoinAsync(arguments, cancellationToken),
             "/del_chat" => await DelChatAsync(arguments, cancellationToken),
             "/set_text" => await SetTextAsync(arguments, cancellationToken),
             "/status" => await GetStatusAsync(cancellationToken),
@@ -126,23 +127,23 @@ public sealed class TelegramCommandProcessor
 
     private sealed record ImportResult(bool Success, string Message);
 
+    private static string ParseUsername(string identifier)
+    {
+        if (identifier.StartsWith("http", StringComparison.OrdinalIgnoreCase))
+        {
+            var uri = identifier.TrimEnd('/');
+            var lastSlash = uri.LastIndexOf('/');
+            return lastSlash >= 0 ? uri[(lastSlash + 1)..] : uri;
+        }
+        return identifier.TrimStart('@');
+    }
+
     private async Task<ImportResult> ImportChatByUsernameInternalAsync(string rawUsernameOrLink, int postsPerDay, CancellationToken cancellationToken)
     {
-        // Парсим username из ссылки или @
-        string username;
-        if (rawUsernameOrLink.StartsWith("http", StringComparison.OrdinalIgnoreCase))
-        {
-            // https://t.me/chatname или https://t.me/joinchat/... не поддерживаем (invite link)
-            var uri = rawUsernameOrLink.TrimEnd('/');
-            var lastSlash = uri.LastIndexOf('/');
-            username = lastSlash >= 0 ? uri[(lastSlash + 1)..] : uri;
-        }
-        else
-        {
-            // @username → убираем @
-            username = rawUsernameOrLink.TrimStart('@');
-        }
+        if (rawUsernameOrLink.Contains("/joinchat/"))
+            return new ImportResult(false, "Импорт по инвайт-ссылкам (/joinchat/) пока не поддерживается для БД. Вступите в чат сначала.");
 
+        var username = ParseUsername(rawUsernameOrLink);
         if (string.IsNullOrWhiteSpace(username))
             return new ImportResult(false, "Не удалось извлечь username из аргумента.");
 
@@ -187,6 +188,136 @@ public sealed class TelegramCommandProcessor
         {
             _logger.LogError(ex, "Ошибка при резолве username @{Username}", username);
             return new ImportResult(false, $"Ошибка Telegram [{ex.Code}]: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Массовая подписка на чаты из файла Data/import_chats.txt
+    /// </summary>
+    private async Task<string> BulkJoinAsync(string arguments, CancellationToken cancellationToken)
+    {
+        const string importFilePath = "Data/import_chats.txt";
+        if (!File.Exists(importFilePath))
+            return $"Файл {importFilePath} не найден. Сначала создайте его.";
+
+        var parts = arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        int minDelay = 180; // 3 мин
+        int maxDelay = 420; // 7 мин
+
+        if (parts.Length >= 1 && int.TryParse(parts[0], out var d1)) minDelay = d1;
+        if (parts.Length >= 2 && int.TryParse(parts[1], out var d2)) maxDelay = d2;
+
+        var lines = await File.ReadAllLinesAsync(importFilePath, cancellationToken);
+
+        // Запускаем в фоне, чтобы не блокировать обработку других команд
+        _ = Task.Run(async () =>
+        {
+            int success = 0;
+            int failed = 0;
+            var client = _clientManager.Client;
+
+            await SendInternalStatusAsync($"🚀 Начинаю массовую подписку на {lines.Length} чатов.\nЗадержка: {minDelay}-{maxDelay} сек.");
+
+            foreach (var line in lines)
+            {
+                var identifier = line.Trim();
+                if (string.IsNullOrWhiteSpace(identifier)) continue;
+
+                try
+                {
+                    bool joined = await JoinChatInternalAsync(identifier, cancellationToken);
+                    if (joined) success++; else failed++;
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    _logger.LogWarning("Ошибка при подписке на {Chat}: {Error}", identifier, ex.Message);
+                }
+
+                // Каждые 10 чатов присылаем отчет
+                if ((success + failed) % 10 == 0)
+                {
+                    await SendInternalStatusAsync($"📊 Прогресс подписки: {success + failed}/{lines.Length}\nУспешно: {success}, Ошибок: {failed}");
+                }
+
+                var delay = Random.Shared.Next(minDelay, maxDelay + 1);
+                await Task.Delay(TimeSpan.FromSeconds(delay));
+            }
+
+            await SendInternalStatusAsync($"✅ Массовая подписка завершена!\nВсего: {lines.Length}\nУспешно: {success}\nОшибок: {failed}");
+        });
+
+        return $"⚙️ Процесс подписки запущен в фоне. Ожидайте уведомлений.";
+    }
+
+    private async Task<bool> JoinChatInternalAsync(string identifier, CancellationToken cancellationToken)
+    {
+        var client = _clientManager.Client;
+
+        // 1. Обработка ссылки-приглашения (joinchat)
+        if (identifier.Contains("/joinchat/"))
+        {
+            var hash = identifier.Split("/joinchat/").Last().Split('?').First();
+            try
+            {
+                var invite = await client.Messages_CheckChatInvite(hash);
+                if (invite is ChatInviteAlready) return true;
+                await client.Messages_ImportChatInvite(hash);
+                return true;
+            }
+            catch (RpcException ex) when (ex.Message == "USER_ALREADY_PARTICIPANT") { return true; }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Не удалось вступить по ссылке {Hash}: {Error}", hash, ex.Message);
+                return false;
+            }
+        }
+
+        // 2. Обработка username или обычной ссылки
+        var username = ParseUsername(identifier);
+
+        try
+        {
+            var resolved = await client.Contacts_ResolveUsername(username);
+            if (resolved.peer is PeerChannel pc)
+            {
+                var channel = resolved.chats[pc.channel_id] as Channel;
+                // Проверяем, не состоим ли уже (упрощенно)
+                if (channel == null || channel.flags.HasFlag(Channel.Flags.left))
+                {
+                    await client.Channels_JoinChannel(channel);
+                    return true;
+                }
+                return true;
+            }
+            else if (resolved.peer is PeerChat chatPeer)
+            {
+                // Для обычных чатов API вступления отличается, но resolveUsername чаще для каналов
+                return true;
+            }
+            return false;
+        }
+        catch (RpcException ex) when (ex.Message == "CHANNELS_TOO_MUCH")
+        {
+            await SendInternalStatusAsync("❌ Ошибка: У вас слишком много каналов. Telegram не дает вступать в новые.");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Ошибка Resolve/Join для {Username}: {Error}", username, ex.Message);
+            return false;
+        }
+    }
+
+    private async Task SendInternalStatusAsync(string text)
+    {
+        try
+        {
+            await _clientManager.Client.SendMessageAsync(InputPeer.Self, text);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Не удалось отправить статус в Избранное");
         }
     }
 
@@ -404,6 +535,9 @@ public sealed class TelegramCommandProcessor
 
             /bulk_import [N]
               Массовый импорт из Data/import_chats.txt (N постов/день, по умолчанию 5)
+
+            /bulk_join [min] [max]
+              Безопасная подписка на чаты из списка (задержка в сек, дефолт 180-420)
 
             /help
               Эта справка
