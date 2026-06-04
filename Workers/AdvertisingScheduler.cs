@@ -190,14 +190,21 @@ public sealed class AdvertisingScheduler : BackgroundService
 
         try
         {
-            var inputPeer = await ResolveInputPeerAsync(client, chat.Id, cancellationToken);
+            _logger.LogInformation("Проверяю чат {ChatId} ({Title})...", chat.Id, chat.Title);
+
+            // 1. Предварительная проверка и вступление
+            var inputPeer = await EnsureMembershipAndPermissionsAsync(client, chat, cancellationToken);
             if (inputPeer is null)
             {
-                WriteLog(db, chat.Id, sentAt, "Error",
-                    $"Чат {chat.Id} не найден в списке диалогов Telegram. Убедитесь, что аккаунт состоит в группе.");
-                _logger.LogWarning("Не удалось разрешить peer для чата {ChatId} ({Title}).", chat.Id, chat.Title);
+                chat.UpdatedAt = DateTime.UtcNow;
+                await db.SaveChangesAsync(cancellationToken);
                 return;
             }
+
+            // 2. Рандомизация перед отправкой (Анти-фрод)
+            var preSendDelay = Random.Shared.Next(15000, 45001);
+            _logger.LogInformation("Пауза перед отправкой {Delay} мс (анти-фрод).", preSendDelay);
+            await Task.Delay(preSendDelay, cancellationToken);
 
             string finalText;
             int typingDelay;
@@ -210,10 +217,10 @@ public sealed class AdvertisingScheduler : BackgroundService
                 if (!string.Equals(finalText, messageText, StringComparison.Ordinal))
                 {
                     var diffRatio = CalculateDifferenceRatio(messageText, finalText);
-                    typingDelay = (int)(3 + (5 * diffRatio));
+                    typingDelay = (int)(3000 + (5000 * diffRatio));
                     
                     _logger.LogInformation(
-                        "✨ «{Title}» ({ChatId}): НОВЫЙ текст от ИИ (+{DiffPercent}%), ожидание {Delay} с.",
+                        "✨ «{Title}» ({ChatId}): НОВЫЙ текст от ИИ (+{DiffPercent}%), время набора {Delay} мс.",
                         chat.Title,
                         chat.Id,
                         (int)(diffRatio * 100),
@@ -221,16 +228,16 @@ public sealed class AdvertisingScheduler : BackgroundService
                 }
                 else
                 {
-                    typingDelay = Random.Shared.Next(3, 8);
+                    typingDelay = Random.Shared.Next(3000, 8001);
                 }
             }
             else
             {
                 finalText = _currentUniqueText ?? messageText;
-                typingDelay = Random.Shared.Next(500, 1200);
+                typingDelay = Random.Shared.Next(1000, 3001);
                 
                 _logger.LogInformation(
-                    "📋 «{Title}» ({ChatId}): копи-паста ({Count}/5), ожидание {Delay} мс.",
+                    "📋 «{Title}» ({ChatId}): копи-паста ({Count}/5), время набора {Delay} мс.",
                     chat.Title,
                     chat.Id,
                     _messagesSentWithCurrentText % 5,
@@ -238,11 +245,13 @@ public sealed class AdvertisingScheduler : BackgroundService
             }
 
             await client.Messages_SetTyping(inputPeer, new SendMessageTypingAction());
-            await Task.Delay(TimeSpan.FromMilliseconds(typingDelay), cancellationToken);
+            await Task.Delay(typingDelay, cancellationToken);
 
             await client.SendMessageAsync(inputPeer, finalText);
 
             chat.LastSentAt = sentAt;
+            chat.UpdatedAt = DateTime.UtcNow;
+            chat.LastErrorMessage = null;
             
             // Обновляем счётчик постов за день
             var now = DateTime.UtcNow;
@@ -272,15 +281,111 @@ public sealed class AdvertisingScheduler : BackgroundService
         }
         catch (RpcException ex)
         {
-            WriteLog(db, chat.Id, sentAt, "Error", $"[{ex.Code}] {ex.Message}");
+            bool isPermanentError = ex.Message is "USER_BANNED_IN_CHANNEL" or "CHAT_WRITE_FORBIDDEN" or "CHAT_RESTRICTED" or "PEER_ID_INVALID" or "SCHEDULE_STATUS_PRIVATE";
+
+            if (isPermanentError)
+            {
+                chat.IsActive = false;
+                _logger.LogWarning("Чат {ChatId} ({Title}) деактивирован из-за перманентной ошибки: {Error}", chat.Id, chat.Title, ex.Message);
+            }
+
+            chat.LastErrorMessage = $"[{ex.Code}] {ex.Message}";
+            chat.UpdatedAt = DateTime.UtcNow;
+            WriteLog(db, chat.Id, sentAt, isPermanentError ? "Banned" : "Error", chat.LastErrorMessage);
             await db.SaveChangesAsync(cancellationToken);
             _logger.LogError(ex, "Ошибка Telegram при отправке в {ChatId}.", chat.Id);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            chat.LastErrorMessage = ex.Message;
+            chat.UpdatedAt = DateTime.UtcNow;
             WriteLog(db, chat.Id, sentAt, "Error", ex.Message);
             await db.SaveChangesAsync(cancellationToken);
             _logger.LogError(ex, "Ошибка при отправке в {ChatId}.", chat.Id);
+        }
+    }
+
+    /// <summary>
+    /// Проверяет подписку, пытается вступить и проверяет права на отправку.
+    /// </summary>
+    private async Task<InputPeer?> EnsureMembershipAndPermissionsAsync(Client client, TargetChat chat, CancellationToken cancellationToken)
+    {
+        try
+        {
+            _logger.LogInformation("Проверяю подписку на {ChatId}...", chat.Id);
+            var chats = await client.Messages_GetAllChats();
+            ChatBase? chatInfo = null;
+
+            if (chats.chats.TryGetValue(chat.Id, out chatInfo)) { }
+            else if (chat.Id <= -1_000_000_000_000)
+            {
+                var channelId = -chat.Id - 1_000_000_000_000;
+                chats.chats.TryGetValue(channelId, out chatInfo);
+            }
+
+            // А. Проверка подписки и попытка Join
+            if (chatInfo is null || (chatInfo is Channel c && c.flags.HasFlag(Channel.Flags.left)))
+            {
+                _logger.LogInformation("Аккаунт не состоит в чате {ChatId}. Попытка вступления...", chat.Id);
+                var inputPeer = await ResolveInputPeerAsync(client, chat.Id, cancellationToken);
+                if (inputPeer is null)
+                {
+                    _logger.LogWarning("Не удалось разрешить peer для чата {ChatId}. Деактивация.", chat.Id);
+                    chat.IsActive = false;
+                    chat.LastErrorMessage = "Peer not found";
+                    return null;
+                }
+
+                if (inputPeer is InputPeerChannel inputChannel)
+                {
+                    await client.Channels_JoinChannel(inputChannel);
+                    _logger.LogInformation("Успешное вступление в канал {ChatId}.", chat.Id);
+                    // Перезапрашиваем инфо после вступления
+                    var fullChannel = await client.Channels_GetFullChannel(inputChannel);
+                    chatInfo = fullChannel.chats.Values.FirstOrDefault();
+                }
+                else
+                {
+                    // Для обычных чатов (редко)
+                    _logger.LogWarning("Авто-вступление в обычные чаты не реализовано. Пропуск.");
+                    return null;
+                }
+            }
+
+            // Б. Проверка прав (Permissions)
+            if (chatInfo is Channel channel)
+            {
+                if (channel.IsBanned())
+                {
+                    _logger.LogWarning("Аккаунт забанен в канале {ChatId}. Деактивация.", chat.Id);
+                    chat.IsActive = false;
+                    chat.LastErrorMessage = "USER_BANNED_IN_CHANNEL";
+                    return null;
+                }
+
+                // Проверка прав на отправку сообщений
+                if (channel.default_banned_rights?.flags.HasFlag(ChatBannedRights.Flags.send_messages) == true)
+                {
+                    _logger.LogWarning("В канале {ChatId} запрещена отправка сообщений (SlowMode или права). Пропуск.", chat.Id);
+                    chat.LastErrorMessage = "CHAT_WRITE_FORBIDDEN (default rights)";
+                    return null;
+                }
+            }
+
+            return await ResolveInputPeerAsync(client, chat.Id, cancellationToken);
+        }
+        catch (RpcException ex) when (ex.Message is "USER_BANNED_IN_CHANNEL" or "CHAT_WRITE_FORBIDDEN" or "CHANNEL_PRIVATE" or "CHANNEL_INVALID")
+        {
+            _logger.LogWarning("Ошибка пре-валидации для {ChatId}: {Error}. Деактивация.", chat.Id, ex.Message);
+            chat.IsActive = false;
+            chat.LastErrorMessage = ex.Message;
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Непредвиденная ошибка при пре-валидации чата {ChatId}.", chat.Id);
+            chat.LastErrorMessage = $"Pre-validation error: {ex.Message}";
+            return null;
         }
     }
 
@@ -295,13 +400,14 @@ public sealed class AdvertisingScheduler : BackgroundService
         string message,
         CancellationToken cancellationToken)
     {
-        SetGlobalPause(waitSeconds);
+        var totalPause = waitSeconds + 10;
+        SetGlobalPause(totalPause);
         WriteLog(db, chatId, sentAt, "Flood", message);
         await db.SaveChangesAsync(cancellationToken);
         _logger.LogWarning(
-            "FLOOD_WAIT_{Seconds}. Планировщик приостановлен на {Seconds} с.",
+            "FLOOD_WAIT_{Seconds}. Планировщик приостановлен на {TotalPause} с.",
             waitSeconds,
-            waitSeconds);
+            totalPause);
     }
 
     private void SetGlobalPause(int seconds)

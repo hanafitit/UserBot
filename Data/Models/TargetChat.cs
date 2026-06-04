@@ -25,4 +25,10 @@ public sealed class TargetChat
 
     /// <summary>Дата последней очистки счётчика (UTC).</summary>
     public DateTime? PostCountResetDateUtc { get; set; }
+
+    /// <summary>Текст последней ошибки (для дебага).</summary>
+    public string? LastErrorMessage { get; set; }
+
+    /// <summary>Время последней проверки/отправки.</summary>
+    public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }
