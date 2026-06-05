@@ -515,14 +515,19 @@ public sealed class TelegramCommandProcessor
         var isNight = localNow.Hour >= 23 || localNow.Hour < 8;
         var nightStatus = isNight ? "😴 Сейчас НОЧЬ (сон до 8:00)" : "⚡ Бот работает";
 
+        // Доп. инфо из TG
+        var me = _clientManager.User;
+        var tgChats = await _clientManager.Client.Messages_GetAllChats();
+        var tgCount = tgChats?.chats?.Count ?? 0;
+
         return $"""
             📊 СТАТУС ЮЗЕРБОТА
+            Аккаунт: {me?.first_name} {me?.last_name} (@{me?.username}, id: {me?.id})
             Серверное время: {localNow:HH:mm} (UTC: {utcNow:HH:mm})
             Статус: {nightStatus}
 
-            Всего чатов: {total}
-            ✅ Активных: {active}
-            ❌ Отключенных: {total - active} (используйте /activate_all)
+            База данных: {total} чатов (✅ {active} / ❌ {total - active})
+            Telegram: состоит в {tgCount} чатах/каналах
 
             📋 Чаты в ротации:
             {chatsList}

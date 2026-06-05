@@ -54,6 +54,18 @@ public sealed class AdvertisingScheduler : BackgroundService
     {
         _logger.LogInformation("Планировщик рассылки запущен (интервал {Interval} мин).", LoopInterval.TotalMinutes);
 
+        // Перед началом — ждем авторизации и проверяем подписки
+        while (!stoppingToken.IsCancellationRequested && _clientManager.User is null)
+        {
+            _logger.LogDebug("Ожидание авторизации для проверки подписок...");
+            await Task.Delay(5000, stoppingToken);
+        }
+
+        if (!stoppingToken.IsCancellationRequested)
+        {
+            await EnsureAllActiveChatsJoinedAsync(stoppingToken);
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
@@ -176,7 +188,12 @@ public sealed class AdvertisingScheduler : BackgroundService
             return;
         }
 
-        _logger.LogInformation("🚀 Начинаю burst-отправку для {Count} чатов.", readyChats.Count);
+        // Перед началом burst — принудительно обновляем кэш диалогов, чтобы Telegram "увидел" чаты
+        _logger.LogInformation("🔄 Обновляю список диалогов для резолва peers...");
+        var dialogs = await _clientManager.Client.Messages_GetDialogs();
+        var tgCount = dialogs is Messages_Dialogs md ? md.chats.Count :
+                      dialogs is Messages_DialogsSlice mds ? mds.chats.Count : 0;
+        _logger.LogInformation("🚀 Начинаю burst-отправку для {Count} чатов. (Доступно диалогов в TG: {TgCount})", readyChats.Count, tgCount);
 
         foreach (var readyChat in readyChats)
         {
@@ -307,7 +324,6 @@ public sealed class AdvertisingScheduler : BackgroundService
             bool isPermanentError = msg.Contains("USER_BANNED_IN_CHANNEL") ||
                                     msg.Contains("CHAT_WRITE_FORBIDDEN") ||
                                     msg.Contains("CHAT_RESTRICTED") ||
-                                    msg.Contains("PEER_ID_INVALID") ||
                                     msg.Contains("SCHEDULE_STATUS_PRIVATE") ||
                                     msg.Contains("CHANNEL_PRIVATE") ||
                                     msg.Contains("CHANNEL_INVALID");
@@ -599,6 +615,60 @@ public sealed class AdvertisingScheduler : BackgroundService
         _logger.LogInformation(
             "🎲 НОВЫЙ ДЕНЬ! Смещения: утро {MorningOffset:+#;-#;0}м, обед {LunchOffset:+#;-#;0}м, вечер {EveningOffset:+#;-#;0}м, ночь {LateOffset:+#;-#;0}м",
             _morningStartOffsetMin, _lunchStartOffsetMin, _eveningStartOffsetMin, _lateNightStartOffsetMin);
+    }
+
+    /// <summary>
+    /// Проверяет все активные чаты в БД и вступает в те, где аккаунт не состоит.
+    /// </summary>
+    private async Task EnsureAllActiveChatsJoinedAsync(CancellationToken ct)
+    {
+        _logger.LogInformation("🚀 Начинаю предварительную проверку подписок на все активные чаты...");
+
+        try
+        {
+            await using var db = await _dbContextFactory.CreateDbContextAsync(ct);
+            var activeChats = await db.TargetChats
+                .Where(c => c.IsActive)
+                .ToListAsync(ct);
+
+            if (activeChats.Count == 0)
+            {
+                _logger.LogInformation("Нет активных чатов для проверки.");
+                return;
+            }
+
+            var client = _clientManager.Client;
+            int joinedCount = 0;
+
+            foreach (var chat in activeChats)
+            {
+                if (ct.IsCancellationRequested) break;
+
+                _logger.LogInformation("Проверка чата {ChatId} ({Title})...", chat.Id, chat.Title);
+
+                var inputPeer = await EnsureMembershipAndPermissionsAsync(client, chat, ct);
+
+                if (inputPeer == null && chat.IsActive)
+                {
+                    // Если EnsureMembershipAndPermissionsAsync вернул null, но чат все еще активен,
+                    // значит вступление не удалось (например, это обычный чат или ошибка резолва).
+                    _logger.LogWarning("Не удалось вступить в чат {ChatId} ({Title}). Ошибка: {Error}", chat.Id, chat.Title, chat.LastErrorMessage);
+                }
+                else if (inputPeer != null)
+                {
+                    joinedCount++;
+                }
+
+                // Тайм-аут 10 секунд между проверками/вступлениями по просьбе пользователя
+                await Task.Delay(10000, ct);
+            }
+
+            _logger.LogInformation("✅ Проверка подписок завершена. Проверено: {Total}, Доступно: {Joined}.", activeChats.Count, joinedCount);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Ошибка во время предварительной проверки подписок.");
+        }
     }
 
     /// <summary>
