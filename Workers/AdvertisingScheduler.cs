@@ -61,7 +61,7 @@ public sealed class AdvertisingScheduler : BackgroundService
                 var now = DateTime.UtcNow;
                 var currentHour = now.Hour;
                 
-                // Ночной сон (23:00-8:00) по местному времени
+                // Ночной сон (23:00-8:00) по местному времени сервера
                 var localNow = DateTime.Now;
                 if (localNow.Hour >= 23 || localNow.Hour < 8)
                 {
@@ -141,7 +141,7 @@ public sealed class AdvertisingScheduler : BackgroundService
             .Where(c => c.IsActive)
             .ToListAsync(cancellationToken);
 
-        _logger.LogDebug("Всего активных чатов в БД: {Count}.", activeChats.Count);
+        _logger.LogInformation("Всего активных чатов в БД: {Count}.", activeChats.Count);
 
         var readyChats = activeChats
             .Where(c => 
@@ -214,8 +214,11 @@ public sealed class AdvertisingScheduler : BackgroundService
             {
                 chat.LastSentAt = sentAt; // Обновляем время, чтобы чат ушел в конец очереди
                 chat.UpdatedAt = DateTime.UtcNow;
-                // Логируем причину в ExecutionLogs, если там еще нет записи (EnsureMembershipAndPermissionsAsync не пишет в логи)
-                WriteLog(db, chat.Id, sentAt, chat.IsActive ? "Error" : "Banned", chat.LastErrorMessage ?? "Pre-validation failed");
+
+                // Если чат был деактивирован (например, забанен), ставим статус Banned, иначе просто Error
+                string logStatus = chat.IsActive ? "Error" : "Banned";
+                WriteLog(db, chat.Id, sentAt, logStatus, chat.LastErrorMessage ?? "Pre-validation failed");
+
                 await db.SaveChangesAsync(cancellationToken);
                 return;
             }
@@ -358,8 +361,7 @@ public sealed class AdvertisingScheduler : BackgroundService
                 var inputPeer = await ResolveInputPeerAsync(client, chat.Id, cancellationToken);
                 if (inputPeer is null)
                 {
-                    _logger.LogWarning("Не удалось разрешить peer для чата {ChatId}. Деактивация.", chat.Id);
-                    chat.IsActive = false;
+                    _logger.LogWarning("Не удалось разрешить peer для чата {ChatId}. Пропуск.", chat.Id);
                     chat.LastErrorMessage = "Peer not found";
                     return null;
                 }
@@ -533,22 +535,21 @@ public sealed class AdvertisingScheduler : BackgroundService
 
     /// <summary>
     /// Определяет, активен ли период для рассылки с учётом случайных суточных смещений.
-    /// Смещения разные каждый день для реалистичности.
-    /// Использует локальное время сервера для соответствия человеческому ритму.
+    /// Использует локальное время сервера.
     /// </summary>
     private (bool IsActive, string Reason) GetActivityStatus(DateTime nowUtc)
     {
-        var nowLocal = nowUtc.ToLocalTime();
+        var localNow = nowUtc.ToLocalTime();
 
         // Проверяем, нужно ли генерировать новые смещения (новый день)
-        if (nowLocal.Date != _offsetsGeneratedForDate)
+        if (localNow.Date != _offsetsGeneratedForDate)
         {
             GenerateDailyOffsets();
-            _offsetsGeneratedForDate = nowLocal.Date;
+            _offsetsGeneratedForDate = localNow.Date;
         }
 
-        var hour = nowLocal.Hour;
-        var minute = nowLocal.Minute;
+        var hour = localNow.Hour;
+        var minute = localNow.Minute;
         var totalMinutesFromMidnight = hour * 60 + minute;
         
         // Утро (8:00 ± 30 мин)
@@ -602,7 +603,6 @@ public sealed class AdvertisingScheduler : BackgroundService
 
     /// <summary>
     /// Устанавливает случайный перерыв перед следующей отправкой.
-    /// В активные периоды (8-9, 13-14, 18-20) отправляем 3-5 чатов подряд, потом пауза.
     /// </summary>
     private void SetRandomBreak()
     {
