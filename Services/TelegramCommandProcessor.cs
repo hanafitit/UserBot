@@ -43,6 +43,7 @@ public sealed class TelegramCommandProcessor
             "/bulk_import" => await BulkImportAsync(arguments, cancellationToken),
             "/bulk_join" => await BulkJoinAsync(arguments, cancellationToken),
             "/del_chat" => await DelChatAsync(arguments, cancellationToken),
+            "/activate_all" => await ActivateAllChatsAsync(cancellationToken),
             "/set_text" => await SetTextAsync(arguments, cancellationToken),
             "/status" => await GetStatusAsync(cancellationToken),
             "/help" => GetHelp(),
@@ -161,11 +162,6 @@ public sealed class TelegramCommandProcessor
             {
                 case PeerChannel peerChannel:
                     var channel = resolved.chats[peerChannel.channel_id] as Channel;
-                    if (channel != null && channel.flags.HasFlag(Channel.Flags.left))
-                    {
-                        _logger.LogInformation("Вступаю в канал @{Username} перед добавлением...", username);
-                        await _clientManager.Client.Channels_JoinChannel(channel);
-                    }
                     chatId = -1000000000000L - peerChannel.channel_id;
                     title = channel?.title ?? username;
                     break;
@@ -435,6 +431,23 @@ public sealed class TelegramCommandProcessor
         return $"❌ Чат «{chat.Title}» удалён из рассылки.";
     }
 
+    private async Task<string> ActivateAllChatsAsync(CancellationToken cancellationToken)
+    {
+        await using var db = await _dbContextFactory.CreateDbContextAsync(cancellationToken);
+        var inactiveChats = await db.TargetChats.Where(c => !c.IsActive).ToListAsync(cancellationToken);
+
+        if (inactiveChats.Count == 0)
+            return "Все чаты и так активны.";
+
+        foreach (var chat in inactiveChats)
+            chat.IsActive = true;
+
+        await db.SaveChangesAsync(cancellationToken);
+        _logger.LogInformation("Активировано {Count} чатов.", inactiveChats.Count);
+
+        return $"✅ Активировано {inactiveChats.Count} чатов. Теперь они снова в ротации.";
+    }
+
     /// <summary>
     /// Устанавливает активный шаблон объявления: /set_text {текст}
     /// </summary>
@@ -497,9 +510,19 @@ public sealed class TelegramCommandProcessor
             ? "⚠️ Шаблон не задан! Используйте /set_text"
             : currentTemplate.BaseText.Trim();
 
+        var localNow = DateTime.Now;
+        var utcNow = DateTime.UtcNow;
+        var isNight = localNow.Hour >= 23 || localNow.Hour < 8;
+        var nightStatus = isNight ? "😴 Сейчас НОЧЬ (сон до 8:00)" : "⚡ Бот работает";
+
         return $"""
             📊 СТАТУС ЮЗЕРБОТА
-            Всего чатов: {total} (Активных: {active})
+            Серверное время: {localNow:HH:mm} (UTC: {utcNow:HH:mm})
+            Статус: {nightStatus}
+
+            Всего чатов: {total}
+            ✅ Активных: {active}
+            ❌ Отключенных: {total - active} (используйте /activate_all)
 
             📋 Чаты в ротации:
             {chatsList}
@@ -528,6 +551,9 @@ public sealed class TelegramCommandProcessor
 
             /del_chat {ID}
               Удалить чат из рассылки
+
+            /activate_all
+              Вернуть все отключенные (❌) чаты в работу
 
             /set_text {текст}
               Установить текст объявления для рассылки
