@@ -22,6 +22,7 @@ public sealed class AdvertisingScheduler : BackgroundService
     private readonly IDbContextFactory<AppDbContext> _dbContextFactory;
     private readonly TelegramClientManager _clientManager;
     private readonly IAiTextService _aiTextService;
+    private readonly SchedulerState _state;
     private readonly ILogger<AdvertisingScheduler> _logger;
     private readonly object _pauseLock = new();
     private DateTime _pausedUntilUtc = DateTime.MinValue;
@@ -41,11 +42,13 @@ public sealed class AdvertisingScheduler : BackgroundService
         IDbContextFactory<AppDbContext> dbContextFactory,
         TelegramClientManager clientManager,
         IAiTextService aiTextService,
+        SchedulerState state,
         ILogger<AdvertisingScheduler> logger)
     {
         _dbContextFactory = dbContextFactory;
         _clientManager = clientManager;
         _aiTextService = aiTextService;
+        _state = state;
         _logger = logger;
     }
 
@@ -63,13 +66,15 @@ public sealed class AdvertisingScheduler : BackgroundService
                 // Ночной сон (23:00-8:00)
                 if (currentHour >= 23 || currentHour < 8)
                 {
+                    _state.CurrentActivityStatus = "💤 Сон до 8:00";
                     _logger.LogInformation("💤 Ночное время. Сон до 8:00.");
                     await Task.Delay(TimeSpan.FromMinutes(30), stoppingToken);
                     continue;
                 }
 
-                if (IsGloballyPaused())
+                if (IsGloballyPaused() || _state.IsManualPaused)
                 {
+                    if (_state.IsManualPaused) _state.CurrentActivityStatus = "⏸️ Пауза (вручную)";
                     await DelayUntilPauseEndsAsync(stoppingToken);
                     continue;
                 }
@@ -83,13 +88,15 @@ public sealed class AdvertisingScheduler : BackgroundService
                     // Определяем период активности (с суточными смещениями)
                     var now = DateTime.Now;
                     var (isActive, reason) = GetActivityStatus(now);
+                    _state.CurrentActivityStatus = reason;
                     
                     if (isActive && DateTime.UtcNow >= _activityPeriodEndUtc)
                     {
                         await ProcessIterationAsync(stoppingToken);
                     }
-                    else if (!isActive && DateTime.UtcNow < _activityPeriodEndUtc)
+                    else if (DateTime.UtcNow < _activityPeriodEndUtc)
                     {
+                        _state.NextPlannedPostUtc = _activityPeriodEndUtc;
                         _logger.LogDebug("⏸️ {Reason}. Пауза до {Time:HH:mm}.", reason, _activityPeriodEndUtc.ToLocalTime());
                     }
                 }
@@ -168,10 +175,15 @@ public sealed class AdvertisingScheduler : BackgroundService
             return;
         }
 
-        await SendToChatAsync(db, readyChat, template.BaseText, cancellationToken);
-
-        // После успешной отправки — установить случайный перерыв до следующей
-        SetRandomBreak();
+        try
+        {
+            await SendToChatAsync(db, readyChat, template.BaseText, cancellationToken);
+        }
+        finally
+        {
+            // Устанавливаем перерыв всегда, чтобы не зациклиться на ошибке
+            SetRandomBreak();
+        }
     }
 
     /// <summary>
@@ -336,12 +348,15 @@ public sealed class AdvertisingScheduler : BackgroundService
                     return null;
                 }
 
-                if (inputPeer is InputPeerChannel inputChannel)
+                if (inputPeer is InputPeerChannel inputPeerChannel)
                 {
-                    await client.Channels_JoinChannel(inputChannel);
+                    // Исправлено: корректное создание InputChannel
+                    var channel = new InputChannel(inputPeerChannel.channel_id, inputPeerChannel.access_hash);
+                    await client.Channels_JoinChannel(channel);
                     _logger.LogInformation("Успешное вступление в канал {ChatId}.", chat.Id);
+
                     // Перезапрашиваем инфо после вступления
-                    var fullChannel = await client.Channels_GetFullChannel(inputChannel);
+                    var fullChannel = await client.Channels_GetFullChannel(channel);
                     chatInfo = fullChannel.chats.Values.FirstOrDefault();
                 }
                 else
@@ -353,18 +368,10 @@ public sealed class AdvertisingScheduler : BackgroundService
             }
 
             // Б. Проверка прав (Permissions)
-            if (chatInfo is Channel channel)
+            if (chatInfo is Channel channelInfo)
             {
-                if (channel.IsBanned())
-                {
-                    _logger.LogWarning("Аккаунт забанен в канале {ChatId}. Деактивация.", chat.Id);
-                    chat.IsActive = false;
-                    chat.LastErrorMessage = "USER_BANNED_IN_CHANNEL";
-                    return null;
-                }
-
-                // Проверка прав на отправку сообщений
-                if (channel.default_banned_rights?.flags.HasFlag(ChatBannedRights.Flags.send_messages) == true)
+                // Проверка прав на отправку сообщений через banned_rights
+                if (channelInfo.default_banned_rights?.flags.HasFlag(ChatBannedRights.Flags.send_messages) == true)
                 {
                     _logger.LogWarning("В канале {ChatId} запрещена отправка сообщений (SlowMode или права). Пропуск.", chat.Id);
                     chat.LastErrorMessage = "CHAT_WRITE_FORBIDDEN (default rights)";
@@ -544,7 +551,7 @@ public sealed class AdvertisingScheduler : BackgroundService
         if (totalMinutesFromMidnight >= lateNightStart && totalMinutesFromMidnight < lateNightEnd)
             return (true, $"🌙 Поздно ({lateNightStart / 60}:{lateNightStart % 60:D2}-{lateNightEnd / 60}:{lateNightEnd % 60:D2})");
         
-        // Неактивные периоды
+        // Неактивные периоды (заполнение пробелов)
         if (hour >= 9 && hour < 13)
             return (false, "💼 Работа (9-13)");
         if (hour >= 14 && hour < 18)

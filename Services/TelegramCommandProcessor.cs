@@ -13,15 +13,18 @@ public sealed class TelegramCommandProcessor
 {
     private readonly IDbContextFactory<AppDbContext> _dbContextFactory;
     private readonly TelegramClientManager _clientManager;
+    private readonly SchedulerState _schedulerState;
     private readonly ILogger<TelegramCommandProcessor> _logger;
 
     public TelegramCommandProcessor(
         IDbContextFactory<AppDbContext> dbContextFactory,
         TelegramClientManager clientManager,
+        SchedulerState schedulerState,
         ILogger<TelegramCommandProcessor> logger)
     {
         _dbContextFactory = dbContextFactory;
         _clientManager = clientManager;
+        _schedulerState = schedulerState;
         _logger = logger;
     }
 
@@ -47,6 +50,9 @@ public sealed class TelegramCommandProcessor
             "/status" => await GetStatusAsync(cancellationToken),
             "/help" => GetHelp(),
             "/logs" => await GetRecentLogsAsync(cancellationToken),
+            "/pause" => PauseScheduler(true),
+            "/resume" => PauseScheduler(false),
+            "/start" => PauseScheduler(false),
             _ => "Неизвестная команда. Используйте /help для справки"
         };
     }
@@ -285,7 +291,7 @@ public sealed class TelegramCommandProcessor
                 // Проверяем, не состоим ли уже (упрощенно)
                 if (channel == null || channel.flags.HasFlag(Channel.Flags.left))
                 {
-                    await client.Channels_JoinChannel(channel);
+                    await client.Channels_JoinChannel(new InputChannel(channel.id, channel.access_hash));
                     return true;
                 }
                 return true;
@@ -492,8 +498,16 @@ public sealed class TelegramCommandProcessor
             ? "⚠️ Шаблон не задан! Используйте /set_text"
             : currentTemplate.BaseText.Trim();
 
+        var nextPost = _schedulerState.NextPlannedPostUtc.HasValue
+            ? _schedulerState.NextPlannedPostUtc.Value.ToLocalTime().ToString("HH:mm")
+            : "—";
+
+        var pauseStatus = _schedulerState.IsManualPaused ? " [ПАУЗА]" : "";
+
         return $"""
-            📊 СТАТУС ЮЗЕРБОТА
+            📊 СТАТУС ЮЗЕРБОТА{pauseStatus}
+            Статус: {_schedulerState.CurrentActivityStatus}
+            Следующая отправка: {nextPost}
             Всего чатов: {total} (Активных: {active})
 
             📋 Чаты в ротации:
@@ -504,10 +518,19 @@ public sealed class TelegramCommandProcessor
             """;
     }
 
+    private string PauseScheduler(bool pause)
+    {
+        _schedulerState.IsManualPaused = pause;
+        return pause ? "⏸️ Планировщик приостановлен." : "▶️ Планировщик запущен.";
+    }
+
     private string GetHelp()
     {
         return """
             📚 СПРАВКА ПО КОМАНДАМ
+
+            /pause - поставить рассылку на паузу
+            /resume (или /start) - продолжить рассылку
 
             /add_chat {ID} {название} [N]
               Добавить чат по ID. N — постов в день (по умолчанию 5)

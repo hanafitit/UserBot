@@ -82,6 +82,7 @@ builder.Services
 
 builder.Services.AddHttpClient();
 builder.Services.AddSingleton<IAiTextService, AiTextService>();
+builder.Services.AddSingleton<SchedulerState>();
 builder.Services.AddDbContextFactory<AppDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
 builder.Services.AddSingleton<TelegramClientManager>();
