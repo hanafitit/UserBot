@@ -176,7 +176,12 @@ public sealed class AdvertisingScheduler : BackgroundService
             return;
         }
 
-        _logger.LogInformation("🚀 Начинаю burst-отправку для {Count} чатов.", readyChats.Count);
+        // Перед началом burst — принудительно обновляем кэш диалогов, чтобы Telegram "увидел" чаты
+        _logger.LogInformation("🔄 Обновляю список диалогов для резолва peers...");
+        var dialogs = await _clientManager.Client.Messages_GetDialogs();
+        var tgCount = dialogs is Messages_Dialogs md ? md.chats.Count :
+                      dialogs is Messages_DialogsSlice mds ? mds.chats.Count : 0;
+        _logger.LogInformation("🚀 Начинаю burst-отправку для {Count} чатов. (Доступно диалогов в TG: {TgCount})", readyChats.Count, tgCount);
 
         foreach (var readyChat in readyChats)
         {
@@ -307,7 +312,6 @@ public sealed class AdvertisingScheduler : BackgroundService
             bool isPermanentError = msg.Contains("USER_BANNED_IN_CHANNEL") ||
                                     msg.Contains("CHAT_WRITE_FORBIDDEN") ||
                                     msg.Contains("CHAT_RESTRICTED") ||
-                                    msg.Contains("PEER_ID_INVALID") ||
                                     msg.Contains("SCHEDULE_STATUS_PRIVATE") ||
                                     msg.Contains("CHANNEL_PRIVATE") ||
                                     msg.Contains("CHANNEL_INVALID");
