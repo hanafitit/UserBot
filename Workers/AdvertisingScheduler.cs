@@ -61,10 +61,11 @@ public sealed class AdvertisingScheduler : BackgroundService
                 var now = DateTime.UtcNow;
                 var currentHour = now.Hour;
                 
-                // Ночной сон (23:00-8:00)
-                if (currentHour >= 23 || currentHour < 8)
+                // Ночной сон (23:00-8:00) по местному времени
+                var localNow = DateTime.Now;
+                if (localNow.Hour >= 23 || localNow.Hour < 8)
                 {
-                    _logger.LogInformation("💤 Ночное время. Сон до 8:00.");
+                    _logger.LogInformation("💤 Ночное время (местное: {Time:HH:mm}). Сон до 8:00.", localNow);
                     await Task.Delay(TimeSpan.FromMinutes(30), stoppingToken);
                     continue;
                 }
@@ -140,6 +141,8 @@ public sealed class AdvertisingScheduler : BackgroundService
             .Where(c => c.IsActive)
             .ToListAsync(cancellationToken);
 
+        _logger.LogDebug("Всего активных чатов в БД: {Count}.", activeChats.Count);
+
         var readyChats = activeChats
             .Where(c => 
             {
@@ -169,7 +172,7 @@ public sealed class AdvertisingScheduler : BackgroundService
 
         if (readyChats.Count == 0)
         {
-            _logger.LogDebug("Нет чатов, готовых к отправке.");
+            _logger.LogDebug("Нет чатов, готовых к отправке (SlowMode или лимит). Всего активных: {Active}.", activeChats.Count);
             return;
         }
 
@@ -531,18 +534,21 @@ public sealed class AdvertisingScheduler : BackgroundService
     /// <summary>
     /// Определяет, активен ли период для рассылки с учётом случайных суточных смещений.
     /// Смещения разные каждый день для реалистичности.
+    /// Использует локальное время сервера для соответствия человеческому ритму.
     /// </summary>
     private (bool IsActive, string Reason) GetActivityStatus(DateTime nowUtc)
     {
+        var nowLocal = nowUtc.ToLocalTime();
+
         // Проверяем, нужно ли генерировать новые смещения (новый день)
-        if (nowUtc.Date != _offsetsGeneratedForDate)
+        if (nowLocal.Date != _offsetsGeneratedForDate)
         {
             GenerateDailyOffsets();
-            _offsetsGeneratedForDate = nowUtc.Date;
+            _offsetsGeneratedForDate = nowLocal.Date;
         }
 
-        var hour = nowUtc.Hour;
-        var minute = nowUtc.Minute;
+        var hour = nowLocal.Hour;
+        var minute = nowLocal.Minute;
         var totalMinutesFromMidnight = hour * 60 + minute;
         
         // Утро (8:00 ± 30 мин)
@@ -600,7 +606,7 @@ public sealed class AdvertisingScheduler : BackgroundService
     /// </summary>
     private void SetRandomBreak()
     {
-        var hour = DateTime.UtcNow.Hour;
+        var hour = DateTime.Now.Hour;
         int breakMinutes;
 
         if (hour >= 8 && hour < 9)
