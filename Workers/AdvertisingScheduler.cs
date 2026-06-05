@@ -58,7 +58,8 @@ public sealed class AdvertisingScheduler : BackgroundService
         {
             try
             {
-                var currentHour = DateTime.Now.Hour;
+                var now = DateTime.UtcNow;
+                var currentHour = now.Hour;
                 
                 // Ночной сон (23:00-8:00)
                 if (currentHour >= 23 || currentHour < 8)
@@ -81,16 +82,19 @@ public sealed class AdvertisingScheduler : BackgroundService
                 else
                 {
                     // Определяем период активности (с суточными смещениями)
-                    var now = DateTime.Now;
                     var (isActive, reason) = GetActivityStatus(now);
                     
-                    if (isActive && DateTime.UtcNow >= _activityPeriodEndUtc)
+                    if (isActive && now >= _activityPeriodEndUtc)
                     {
                         await ProcessIterationAsync(stoppingToken);
                     }
-                    else if (!isActive && DateTime.UtcNow < _activityPeriodEndUtc)
+                    else if (!isActive)
                     {
-                        _logger.LogDebug("⏸️ {Reason}. Пауза до {Time:HH:mm}.", reason, _activityPeriodEndUtc.ToLocalTime());
+                         _logger.LogDebug("⏸️ {Reason}.", reason);
+                    }
+                    else if (now < _activityPeriodEndUtc)
+                    {
+                        _logger.LogDebug("⏸️ {Reason}. Ожидание окончания перерыва до {Time:HH:mm} (UTC).", reason, _activityPeriodEndUtc.ToShortTimeString());
                     }
                 }
             }
@@ -110,8 +114,8 @@ public sealed class AdvertisingScheduler : BackgroundService
     }
 
     /// <summary>
-    /// В активные периоды отправляем чаты с длительными случайными перерывами.
-    /// Проверяет лимиты постов в день и SlowMode для каждого чата.
+    /// В активные периоды отправляем пачку чатов (burst) с короткими перерывами,
+    /// затем делаем длительную паузу.
     /// </summary>
     private async Task ProcessIterationAsync(CancellationToken cancellationToken)
     {
@@ -136,7 +140,7 @@ public sealed class AdvertisingScheduler : BackgroundService
             .Where(c => c.IsActive)
             .ToListAsync(cancellationToken);
 
-        var readyChat = activeChats
+        var readyChats = activeChats
             .Where(c => 
             {
                 // Проверка SlowMode
@@ -160,17 +164,26 @@ public sealed class AdvertisingScheduler : BackgroundService
                 return true;
             })
             .OrderBy(c => c.LastSentAt ?? DateTime.MinValue)
-            .FirstOrDefault();
+            .Take(Random.Shared.Next(3, 6)) // Burst 3-5 чатов
+            .ToList();
 
-        if (readyChat is null)
+        if (readyChats.Count == 0)
         {
             _logger.LogDebug("Нет чатов, готовых к отправке.");
             return;
         }
 
-        await SendToChatAsync(db, readyChat, template.BaseText, cancellationToken);
+        _logger.LogInformation("🚀 Начинаю burst-отправку для {Count} чатов.", readyChats.Count);
 
-        // После успешной отправки — установить случайный перерыв до следующей
+        foreach (var readyChat in readyChats)
+        {
+            if (cancellationToken.IsCancellationRequested) break;
+            if (IsGloballyPaused()) break;
+
+            await SendToChatAsync(db, readyChat, template.BaseText, cancellationToken);
+        }
+
+        // После завершения burst — установить случайный перерыв до следующей итерации
         SetRandomBreak();
     }
 
@@ -196,7 +209,10 @@ public sealed class AdvertisingScheduler : BackgroundService
             var inputPeer = await EnsureMembershipAndPermissionsAsync(client, chat, cancellationToken);
             if (inputPeer is null)
             {
+                chat.LastSentAt = sentAt; // Обновляем время, чтобы чат ушел в конец очереди
                 chat.UpdatedAt = DateTime.UtcNow;
+                // Логируем причину в ExecutionLogs, если там еще нет записи (EnsureMembershipAndPermissionsAsync не пишет в логи)
+                WriteLog(db, chat.Id, sentAt, chat.IsActive ? "Error" : "Banned", chat.LastErrorMessage ?? "Pre-validation failed");
                 await db.SaveChangesAsync(cancellationToken);
                 return;
             }
@@ -281,7 +297,14 @@ public sealed class AdvertisingScheduler : BackgroundService
         }
         catch (RpcException ex)
         {
-            bool isPermanentError = ex.Message is "USER_BANNED_IN_CHANNEL" or "CHAT_WRITE_FORBIDDEN" or "CHAT_RESTRICTED" or "PEER_ID_INVALID" or "SCHEDULE_STATUS_PRIVATE";
+            var msg = ex.Message ?? "";
+            bool isPermanentError = msg.Contains("USER_BANNED_IN_CHANNEL") ||
+                                    msg.Contains("CHAT_WRITE_FORBIDDEN") ||
+                                    msg.Contains("CHAT_RESTRICTED") ||
+                                    msg.Contains("PEER_ID_INVALID") ||
+                                    msg.Contains("SCHEDULE_STATUS_PRIVATE") ||
+                                    msg.Contains("CHANNEL_PRIVATE") ||
+                                    msg.Contains("CHANNEL_INVALID");
 
             if (isPermanentError)
             {
@@ -289,6 +312,7 @@ public sealed class AdvertisingScheduler : BackgroundService
                 _logger.LogWarning("Чат {ChatId} ({Title}) деактивирован из-за перманентной ошибки: {Error}", chat.Id, chat.Title, ex.Message);
             }
 
+            chat.LastSentAt = sentAt; // Даже при ошибке обновляем время попытки
             chat.LastErrorMessage = $"[{ex.Code}] {ex.Message}";
             chat.UpdatedAt = DateTime.UtcNow;
             WriteLog(db, chat.Id, sentAt, isPermanentError ? "Banned" : "Error", chat.LastErrorMessage);
@@ -297,6 +321,7 @@ public sealed class AdvertisingScheduler : BackgroundService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            chat.LastSentAt = sentAt; // Даже при ошибке обновляем время попытки
             chat.LastErrorMessage = ex.Message;
             chat.UpdatedAt = DateTime.UtcNow;
             WriteLog(db, chat.Id, sentAt, "Error", ex.Message);
@@ -374,7 +399,7 @@ public sealed class AdvertisingScheduler : BackgroundService
 
             return await ResolveInputPeerAsync(client, chat.Id, cancellationToken);
         }
-        catch (RpcException ex) when (ex.Message is "USER_BANNED_IN_CHANNEL" or "CHAT_WRITE_FORBIDDEN" or "CHANNEL_PRIVATE" or "CHANNEL_INVALID")
+        catch (RpcException ex) when (ex.Message is "USER_BANNED_IN_CHANNEL" or "CHAT_WRITE_FORBIDDEN" or "CHANNEL_PRIVATE" or "CHANNEL_INVALID" or "CHAT_RESTRICTED")
         {
             _logger.LogWarning("Ошибка пре-валидации для {ChatId}: {Error}. Деактивация.", chat.Id, ex.Message);
             chat.IsActive = false;
@@ -507,17 +532,17 @@ public sealed class AdvertisingScheduler : BackgroundService
     /// Определяет, активен ли период для рассылки с учётом случайных суточных смещений.
     /// Смещения разные каждый день для реалистичности.
     /// </summary>
-    private (bool IsActive, string Reason) GetActivityStatus(DateTime now)
+    private (bool IsActive, string Reason) GetActivityStatus(DateTime nowUtc)
     {
         // Проверяем, нужно ли генерировать новые смещения (новый день)
-        if (now.Date != _offsetsGeneratedForDate)
+        if (nowUtc.Date != _offsetsGeneratedForDate)
         {
             GenerateDailyOffsets();
-            _offsetsGeneratedForDate = now.Date;
+            _offsetsGeneratedForDate = nowUtc.Date;
         }
 
-        var hour = now.Hour;
-        var minute = now.Minute;
+        var hour = nowUtc.Hour;
+        var minute = nowUtc.Minute;
         var totalMinutesFromMidnight = hour * 60 + minute;
         
         // Утро (8:00 ± 30 мин)
@@ -575,7 +600,7 @@ public sealed class AdvertisingScheduler : BackgroundService
     /// </summary>
     private void SetRandomBreak()
     {
-        var hour = DateTime.Now.Hour;
+        var hour = DateTime.UtcNow.Hour;
         int breakMinutes;
 
         if (hour >= 8 && hour < 9)
