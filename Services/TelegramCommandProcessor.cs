@@ -161,6 +161,11 @@ public sealed class TelegramCommandProcessor
             {
                 case PeerChannel peerChannel:
                     var channel = resolved.chats[peerChannel.channel_id] as Channel;
+                    if (channel != null && channel.flags.HasFlag(Channel.Flags.left))
+                    {
+                        _logger.LogInformation("Вступаю в канал @{Username} перед добавлением...", username);
+                        await _clientManager.Client.Channels_JoinChannel(channel);
+                    }
                     chatId = -1000000000000L - peerChannel.channel_id;
                     title = channel?.title ?? username;
                     break;
