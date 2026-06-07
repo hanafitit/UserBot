@@ -179,7 +179,6 @@ public sealed class AdvertisingScheduler : BackgroundService
                 return true;
             })
             .OrderBy(c => c.LastSentAt ?? DateTime.MinValue)
-            .Take(Random.Shared.Next(3, 6)) // Burst 3-5 чатов
             .ToList();
 
         if (readyChats.Count == 0)
@@ -188,22 +187,17 @@ public sealed class AdvertisingScheduler : BackgroundService
             return;
         }
 
-        // Перед началом burst — принудительно обновляем кэш диалогов, чтобы Telegram "увидел" чаты
+        // Перед началом — принудительно обновляем кэш диалогов, чтобы Telegram "увидел" чаты
         _logger.LogInformation("🔄 Обновляю список диалогов для резолва peers...");
         var dialogs = await _clientManager.Client.Messages_GetDialogs();
         var tgCount = dialogs is Messages_Dialogs md ? md.chats.Count :
                       dialogs is Messages_DialogsSlice mds ? mds.chats.Count : 0;
-        _logger.LogInformation("🚀 Начинаю burst-отправку для {Count} чатов. (Доступно диалогов в TG: {TgCount})", readyChats.Count, tgCount);
+        _logger.LogInformation("🚀 Начинаю отправку для {Count} чатов. (Доступно диалогов в TG: {TgCount})", readyChats.Count, tgCount);
 
-        foreach (var readyChat in readyChats)
-        {
-            if (cancellationToken.IsCancellationRequested) break;
-            if (IsGloballyPaused()) break;
+        // Выполняем обход чатов по очереди (согласно техническому заданию)
+        await ProcessChatsAsync(db, readyChats, template.BaseText, cancellationToken);
 
-            await SendToChatAsync(db, readyChat, template.BaseText, cancellationToken);
-        }
-
-        // После завершения burst — установить случайный перерыв до следующей итерации
+        // После завершения — установить случайный перерыв до следующей итерации
         SetRandomBreak();
     }
 
@@ -239,11 +233,6 @@ public sealed class AdvertisingScheduler : BackgroundService
                 await db.SaveChangesAsync(cancellationToken);
                 return;
             }
-
-            // 2. Рандомизация перед отправкой (Анти-фрод)
-            var preSendDelay = Random.Shared.Next(15000, 45001);
-            _logger.LogInformation("Пауза перед отправкой {Delay} мс (анти-фрод).", preSendDelay);
-            await Task.Delay(preSendDelay, cancellationToken);
 
             string finalText;
             int typingDelay;
@@ -312,11 +301,13 @@ public sealed class AdvertisingScheduler : BackgroundService
         catch (TelegramFloodWaitException ex)
         {
             await HandleFloodAsync(db, chat.Id, sentAt, ex.RetryAfterSeconds, ex.Message, cancellationToken);
+            throw new RpcException(420, ex.Message); // Пробрасываем для ProcessChatsAsync
         }
         catch (RpcException ex) when (ex.Code == 420)
         {
             var waitSeconds = ex.X > 0 ? ex.X : 30;
             await HandleFloodAsync(db, chat.Id, sentAt, waitSeconds, ex.Message, cancellationToken);
+            throw; // Пробрасываем для ProcessChatsAsync
         }
         catch (RpcException ex)
         {
@@ -668,6 +659,57 @@ public sealed class AdvertisingScheduler : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Ошибка во время предварительной проверки подписок.");
+        }
+    }
+
+    /// <summary>
+    /// Асинхронный метод для последовательного обхода чатов с задержкой и обработкой FLOOD_WAIT.
+    /// </summary>
+    private async Task ProcessChatsAsync(AppDbContext db, List<TargetChat> chats, string messageText, CancellationToken cancellationToken)
+    {
+        for (int i = 0; i < chats.Count; i++)
+        {
+            if (cancellationToken.IsCancellationRequested) break;
+
+            // Если планировщик на глобальной паузе - ждем
+            if (IsGloballyPaused())
+            {
+                await DelayUntilPauseEndsAsync(cancellationToken);
+            }
+
+            var chat = chats[i];
+            var delaySeconds = Random.Shared.Next(7, 13);
+
+            // Логирование согласно ТЗ: индекс, ID чата и задержка
+            _logger.LogInformation("Обработка {Current} из {Total} | ID чата: {ChatId} | Задержка до следующего шага: {Delay}с",
+                i + 1, chats.Count, chat.Id, delaySeconds);
+
+            try
+            {
+                await SendToChatAsync(db, chat, messageText, cancellationToken);
+            }
+            catch (RpcException ex) when (ex.Code == 420)
+            {
+                // Обработка FLOOD_WAIT согласно ТЗ: сон на e.X + 1 секунд и продолжение
+                var waitSeconds = ex.X + 1;
+                _logger.LogWarning("🛑 FLOOD_WAIT: засыпаю на {Seconds}с. После паузы выполнение продолжится.", waitSeconds);
+
+                await Task.Delay(TimeSpan.FromSeconds(waitSeconds), cancellationToken);
+
+                // Пробуем этот же чат снова после паузы
+                i--;
+                continue;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Ошибка при обработке чата {ChatId} в цикле обхода.", chat.Id);
+            }
+
+            // Задержка между запросами согласно ТЗ (кроме последнего чата в списке)
+            if (i < chats.Count - 1)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken);
+            }
         }
     }
 
