@@ -179,6 +179,8 @@ public sealed class AdvertisingScheduler : BackgroundService
                 return true;
             })
             .OrderBy(c => c.LastSentAt ?? DateTime.MinValue)
+            .Take(50) // Берем первые 50 из очереди
+            .OrderBy(_ => Random.Shared.Next()) // Перемешиваем для избежания паттернов
             .ToList();
 
         if (readyChats.Count == 0)
@@ -213,7 +215,8 @@ public sealed class AdvertisingScheduler : BackgroundService
     {
         var client = _clientManager.Client;
         var sentAt = DateTime.UtcNow;
-        bool shouldUnicalize = _messagesSentWithCurrentText % 5 == 0;
+        // Уникализируем каждый 2-й или 3-й пост (выбирается случайно) для максимальной вариативности
+        bool shouldUnicalize = _messagesSentWithCurrentText % Random.Shared.Next(2, 4) == 0;
 
         try
         {
@@ -245,7 +248,8 @@ public sealed class AdvertisingScheduler : BackgroundService
                 if (!string.Equals(finalText, messageText, StringComparison.Ordinal))
                 {
                     var diffRatio = CalculateDifferenceRatio(messageText, finalText);
-                    typingDelay = (int)(3000 + (5000 * diffRatio));
+                    // Увеличиваем базу и добавляем рандом к набору
+                    typingDelay = (int)(4000 + (6000 * diffRatio)) + Random.Shared.Next(0, 2001);
                     
                     _logger.LogInformation(
                         "✨ «{Title}» ({ChatId}): НОВЫЙ текст от ИИ (+{DiffPercent}%), время набора {Delay} мс.",
@@ -256,19 +260,18 @@ public sealed class AdvertisingScheduler : BackgroundService
                 }
                 else
                 {
-                    typingDelay = Random.Shared.Next(3000, 8001);
+                    typingDelay = Random.Shared.Next(4000, 9001);
                 }
             }
             else
             {
                 finalText = _currentUniqueText ?? messageText;
-                typingDelay = Random.Shared.Next(1000, 3001);
+                typingDelay = Random.Shared.Next(2000, 5001);
                 
                 _logger.LogInformation(
-                    "📋 «{Title}» ({ChatId}): копи-паста ({Count}/5), время набора {Delay} мс.",
+                    "📋 «{Title}» ({ChatId}): копи-паста, время набора {Delay} мс.",
                     chat.Title,
                     chat.Id,
-                    _messagesSentWithCurrentText % 5,
                     typingDelay);
             }
 
@@ -650,8 +653,9 @@ public sealed class AdvertisingScheduler : BackgroundService
                     joinedCount++;
                 }
 
-                // Тайм-аут 10 секунд между проверками/вступлениями по просьбе пользователя
-                await Task.Delay(10000, ct);
+                // Тайм-аут 30-60 секунд между проверками/вступлениями (анти-бан)
+                var joinDelay = Random.Shared.Next(30000, 60001);
+                await Task.Delay(joinDelay, ct);
             }
 
             _logger.LogInformation("✅ Проверка подписок завершена. Проверено: {Total}, Доступно: {Joined}.", activeChats.Count, joinedCount);
@@ -667,6 +671,9 @@ public sealed class AdvertisingScheduler : BackgroundService
     /// </summary>
     private async Task ProcessChatsAsync(AppDbContext db, List<TargetChat> chats, string messageText, CancellationToken cancellationToken)
     {
+        int humanBreakCounter = 0;
+        int nextHumanBreakAt = Random.Shared.Next(15, 26);
+
         for (int i = 0; i < chats.Count; i++)
         {
             if (cancellationToken.IsCancellationRequested) break;
@@ -677,8 +684,21 @@ public sealed class AdvertisingScheduler : BackgroundService
                 await DelayUntilPauseEndsAsync(cancellationToken);
             }
 
+            // Имитация "человеческого перерыва" каждые 15-25 чатов
+            if (humanBreakCounter >= nextHumanBreakAt)
+            {
+                var breakMinutes = Random.Shared.Next(10, 21);
+                _logger.LogInformation("☕ Человеческий перерыв: отдыхаю {Minutes} минут после обработки {Count} чатов.", breakMinutes, humanBreakCounter);
+                await Task.Delay(TimeSpan.FromMinutes(breakMinutes), cancellationToken);
+
+                humanBreakCounter = 0;
+                nextHumanBreakAt = Random.Shared.Next(15, 26);
+            }
+
             var chat = chats[i];
-            var delaySeconds = Random.Shared.Next(7, 13);
+            // Рандомизируем задержку: обычно 7-12с, но иногда (в 10% случаев) делаем длинную паузу 20-45с
+            var isLongDelay = Random.Shared.Next(0, 100) < 10;
+            var delaySeconds = isLongDelay ? Random.Shared.Next(20, 46) : Random.Shared.Next(7, 13);
 
             // Логирование согласно ТЗ: индекс, ID чата и задержка
             _logger.LogInformation("Обработка {Current} из {Total} | ID чата: {ChatId} | Задержка до следующего шага: {Delay}с",
@@ -687,6 +707,7 @@ public sealed class AdvertisingScheduler : BackgroundService
             try
             {
                 await SendToChatAsync(db, chat, messageText, cancellationToken);
+                humanBreakCounter++;
             }
             catch (RpcException ex) when (ex.Code == 420)
             {
