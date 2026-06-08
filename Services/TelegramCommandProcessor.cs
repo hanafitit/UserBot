@@ -397,7 +397,7 @@ public sealed class TelegramCommandProcessor
             Id = chatId,
             Title = title,
             IsActive = true,
-            SlowModeSeconds = 60,
+            SlowModeSeconds = 600,
             PostsPerDay = postsPerDay
         });
 
