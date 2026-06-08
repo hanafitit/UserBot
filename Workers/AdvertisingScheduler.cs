@@ -191,13 +191,18 @@ public sealed class AdvertisingScheduler : BackgroundService
 
         // Перед началом — принудительно обновляем кэш диалогов, чтобы Telegram "увидел" чаты
         _logger.LogInformation("🔄 Обновляю список диалогов для резолва peers...");
-        var dialogs = await _clientManager.Client.Messages_GetDialogs();
-        var tgCount = dialogs is Messages_Dialogs md ? md.chats.Count :
-                      dialogs is Messages_DialogsSlice mds ? mds.chats.Count : 0;
+        var dialogs = await _clientManager.Client.Messages_GetAllChats();
+        var tgCount = dialogs?.chats?.Count ?? 0;
         _logger.LogInformation("🚀 Начинаю отправку для {Count} чатов. (Доступно диалогов в TG: {TgCount})", readyChats.Count, tgCount);
 
+        if (dialogs == null)
+        {
+            _logger.LogError("Не удалось загрузить кэш чатов из Telegram. Пропуск итерации.");
+            return;
+        }
+
         // Выполняем обход чатов по очереди (согласно техническому заданию)
-        await ProcessChatsAsync(db, readyChats, template.BaseText, cancellationToken);
+        await ProcessChatsAsync(db, readyChats, template.BaseText, dialogs, cancellationToken);
 
         // После завершения — установить случайный перерыв до следующей итерации
         SetRandomBreak();
@@ -211,6 +216,7 @@ public sealed class AdvertisingScheduler : BackgroundService
         AppDbContext db,
         TargetChat chat,
         string messageText,
+        Messages_Chats chatCache,
         CancellationToken cancellationToken)
     {
         var client = _clientManager.Client;
@@ -223,7 +229,9 @@ public sealed class AdvertisingScheduler : BackgroundService
             _logger.LogInformation("Проверяю чат {ChatId} ({Title})...", chat.Id, chat.Title);
 
             // 1. Предварительная проверка и вступление
-            var inputPeer = await EnsureMembershipAndPermissionsAsync(client, chat, cancellationToken);
+            var checkResult = await EnsureMembershipAndPermissionsAsync(client, chat, chatCache, cancellationToken);
+            var inputPeer = checkResult.InputPeer;
+
             if (inputPeer is null)
             {
                 chat.LastSentAt = sentAt; // Обновляем время, чтобы чат ушел в конец очереди
@@ -346,49 +354,56 @@ public sealed class AdvertisingScheduler : BackgroundService
         }
     }
 
+    private sealed record MembershipCheckResult(InputPeer? InputPeer, bool JustJoined);
+
     /// <summary>
     /// Проверяет подписку, пытается вступить и проверяет права на отправку.
     /// </summary>
-    private async Task<InputPeer?> EnsureMembershipAndPermissionsAsync(Client client, TargetChat chat, CancellationToken cancellationToken)
+    private async Task<MembershipCheckResult> EnsureMembershipAndPermissionsAsync(Client client, TargetChat chat, Messages_Chats chatCache, CancellationToken cancellationToken)
     {
         try
         {
             _logger.LogInformation("Проверяю подписку на {ChatId}...", chat.Id);
-            var chats = await client.Messages_GetAllChats();
             ChatBase? chatInfo = null;
 
-            if (chats.chats.TryGetValue(chat.Id, out chatInfo)) { }
+            if (chatCache.chats.TryGetValue(chat.Id, out chatInfo)) { }
             else if (chat.Id <= -1_000_000_000_000)
             {
                 var channelId = -chat.Id - 1_000_000_000_000;
-                chats.chats.TryGetValue(channelId, out chatInfo);
+                chatCache.chats.TryGetValue(channelId, out chatInfo);
             }
+
+            bool justJoined = false;
 
             // А. Проверка подписки и попытка Join
             if (chatInfo is null || (chatInfo is Channel c && c.flags.HasFlag(Channel.Flags.left)))
             {
                 _logger.LogInformation("Аккаунт не состоит в чате {ChatId}. Попытка вступления...", chat.Id);
-                var inputPeer = await ResolveInputPeerAsync(client, chat.Id, cancellationToken);
+                var inputPeer = ResolveInputPeerFromCache(chatCache, chat.Id);
                 if (inputPeer is null)
                 {
                     _logger.LogWarning("Не удалось разрешить peer для чата {ChatId}. Пропуск.", chat.Id);
                     chat.LastErrorMessage = "Peer not found";
-                    return null;
+                    return new MembershipCheckResult(null, false);
                 }
 
                 if (inputPeer is InputPeerChannel inputChannel)
                 {
                     await client.Channels_JoinChannel(inputChannel);
+                    justJoined = true;
                     _logger.LogInformation("Успешное вступление в канал {ChatId}.", chat.Id);
                     // Перезапрашиваем инфо после вступления
                     var fullChannel = await client.Channels_GetFullChannel(inputChannel);
                     chatInfo = fullChannel.chats.Values.FirstOrDefault();
+
+                    // Обновляем кэш
+                    if (chatInfo != null) chatCache.chats[chatInfo.ID] = chatInfo;
                 }
                 else
                 {
                     // Для обычных чатов (редко)
                     _logger.LogWarning("Авто-вступление в обычные чаты не реализовано. Пропуск.");
-                    return null;
+                    return new MembershipCheckResult(null, false);
                 }
             }
 
@@ -400,7 +415,7 @@ public sealed class AdvertisingScheduler : BackgroundService
                     _logger.LogWarning("Аккаунт забанен в канале {ChatId}. Деактивация.", chat.Id);
                     chat.IsActive = false;
                     chat.LastErrorMessage = "USER_BANNED_IN_CHANNEL";
-                    return null;
+                    return new MembershipCheckResult(null, false);
                 }
 
                 // Проверка прав на отправку сообщений
@@ -408,24 +423,40 @@ public sealed class AdvertisingScheduler : BackgroundService
                 {
                     _logger.LogWarning("В канале {ChatId} запрещена отправка сообщений (SlowMode или права). Пропуск.", chat.Id);
                     chat.LastErrorMessage = "CHAT_WRITE_FORBIDDEN (default rights)";
-                    return null;
+                    return new MembershipCheckResult(null, false);
                 }
             }
 
-            return await ResolveInputPeerAsync(client, chat.Id, cancellationToken);
+            return new MembershipCheckResult(ResolveInputPeerFromCache(chatCache, chat.Id), justJoined);
         }
-        catch (RpcException ex) when (ex.Message is "USER_BANNED_IN_CHANNEL" or "CHAT_WRITE_FORBIDDEN" or "CHANNEL_PRIVATE" or "CHANNEL_INVALID" or "CHAT_RESTRICTED")
+        catch (RpcException ex)
         {
-            _logger.LogWarning("Ошибка пре-валидации для {ChatId}: {Error}. Деактивация.", chat.Id, ex.Message);
-            chat.IsActive = false;
-            chat.LastErrorMessage = ex.Message;
-            return null;
+            var msg = ex.Message ?? "";
+            bool isPermanentError = msg.Contains("USER_BANNED_IN_CHANNEL") ||
+                                    msg.Contains("CHAT_WRITE_FORBIDDEN") ||
+                                    msg.Contains("CHAT_RESTRICTED") ||
+                                    msg.Contains("SCHEDULE_STATUS_PRIVATE") ||
+                                    msg.Contains("CHANNEL_PRIVATE") ||
+                                    msg.Contains("CHANNEL_INVALID");
+
+            if (isPermanentError)
+            {
+                _logger.LogWarning("Ошибка пре-валидации для {ChatId}: {Error}. Деактивация.", chat.Id, ex.Message);
+                chat.IsActive = false;
+                chat.LastErrorMessage = ex.Message;
+            }
+            else
+            {
+                _logger.LogWarning("Временная ошибка пре-валидации для {ChatId}: {Error}.", chat.Id, ex.Message);
+                chat.LastErrorMessage = ex.Message;
+            }
+            return new MembershipCheckResult(null, false);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Непредвиденная ошибка при пре-валидации чата {ChatId}.", chat.Id);
             chat.LastErrorMessage = $"Pre-validation error: {ex.Message}";
-            return null;
+            return new MembershipCheckResult(null, false);
         }
     }
 
@@ -474,8 +505,10 @@ public sealed class AdvertisingScheduler : BackgroundService
 
         if (delay > TimeSpan.Zero)
         {
-            _logger.LogDebug("Планировщик на паузе ещё {Seconds:F0} с.", delay.TotalSeconds);
+            _logger.LogWarning("⏸️ Планировщик на паузе из-за FLOOD_WAIT до {Time:HH:mm:ss} (осталось {Seconds:F0} с).",
+                _pausedUntilUtc.ToLocalTime(), delay.TotalSeconds);
             await Task.Delay(delay, cancellationToken);
+            _logger.LogInformation("▶️ Пауза FLOOD_WAIT окончена, возобновляю работу.");
         }
     }
 
@@ -504,26 +537,24 @@ public sealed class AdvertisingScheduler : BackgroundService
     /// <summary>
     /// Ищет чат в кэше Telegram по ID (в т.ч. формат -100… для супергрупп).
     /// </summary>
-    private static async Task<InputPeer?> ResolveInputPeerAsync(
-        Client client,
-        long chatId,
-        CancellationToken cancellationToken)
+    private static InputPeer? ResolveInputPeerFromCache(
+        Messages_Chats cache,
+        long chatId)
     {
-        var chats = await client.Messages_GetAllChats();
-        if (chats?.chats is null)
+        if (cache?.chats is null)
             return null;
 
-        if (chats.chats.TryGetValue(chatId, out var chat))
+        if (cache.chats.TryGetValue(chatId, out var chat))
             return chat;
 
         if (chatId <= -1_000_000_000_000)
         {
             var channelId = -chatId - 1_000_000_000_000;
-            if (chats.chats.TryGetValue(channelId, out chat))
+            if (cache.chats.TryGetValue(channelId, out chat))
                 return chat;
         }
 
-        var foundChat = chats.chats.Values.FirstOrDefault(c => c?.ID == chatId);
+        var foundChat = cache.chats.Values.FirstOrDefault(c => c?.ID == chatId);
         return foundChat;
     }
 
@@ -633,6 +664,7 @@ public sealed class AdvertisingScheduler : BackgroundService
 
             var client = _clientManager.Client;
             int joinedCount = 0;
+            var chatCache = await client.Messages_GetAllChats();
 
             foreach (var chat in activeChats)
             {
@@ -640,24 +672,28 @@ public sealed class AdvertisingScheduler : BackgroundService
 
                 _logger.LogInformation("Проверка чата {ChatId} ({Title})...", chat.Id, chat.Title);
 
-                var inputPeer = await EnsureMembershipAndPermissionsAsync(client, chat, ct);
+                var checkResult = await EnsureMembershipAndPermissionsAsync(client, chat, chatCache, ct);
 
-                if (inputPeer == null && chat.IsActive)
+                if (checkResult.InputPeer == null && chat.IsActive)
                 {
                     // Если EnsureMembershipAndPermissionsAsync вернул null, но чат все еще активен,
                     // значит вступление не удалось (например, это обычный чат или ошибка резолва).
                     _logger.LogWarning("Не удалось вступить в чат {ChatId} ({Title}). Ошибка: {Error}", chat.Id, chat.Title, chat.LastErrorMessage);
                 }
-                else if (inputPeer != null)
+                else if (checkResult.InputPeer != null)
                 {
                     joinedCount++;
                 }
 
-                // Тайм-аут 30-60 секунд между проверками/вступлениями (анти-бан)
-                var joinDelay = Random.Shared.Next(30000, 60001);
+                // Анти-бан пауза: если было вступление - ждем долго (30-60с), если просто проверка - быстро (2-5с)
+                var joinDelay = checkResult.JustJoined
+                    ? Random.Shared.Next(30000, 60001)
+                    : Random.Shared.Next(2000, 5001);
+
                 await Task.Delay(joinDelay, ct);
             }
 
+            await db.SaveChangesAsync(ct);
             _logger.LogInformation("✅ Проверка подписок завершена. Проверено: {Total}, Доступно: {Joined}.", activeChats.Count, joinedCount);
         }
         catch (Exception ex)
@@ -669,7 +705,7 @@ public sealed class AdvertisingScheduler : BackgroundService
     /// <summary>
     /// Асинхронный метод для последовательного обхода чатов с задержкой и обработкой FLOOD_WAIT.
     /// </summary>
-    private async Task ProcessChatsAsync(AppDbContext db, List<TargetChat> chats, string messageText, CancellationToken cancellationToken)
+    private async Task ProcessChatsAsync(AppDbContext db, List<TargetChat> chats, string messageText, Messages_Chats chatCache, CancellationToken cancellationToken)
     {
         int humanBreakCounter = 0;
         int nextHumanBreakAt = Random.Shared.Next(15, 26);
@@ -688,11 +724,13 @@ public sealed class AdvertisingScheduler : BackgroundService
             if (humanBreakCounter >= nextHumanBreakAt)
             {
                 var breakMinutes = Random.Shared.Next(10, 21);
-                _logger.LogInformation("☕ Человеческий перерыв: отдыхаю {Minutes} минут после обработки {Count} чатов.", breakMinutes, humanBreakCounter);
+                _logger.LogInformation("☕ Человеческий перерыв: отдыхаю {Minutes} минут до {Time:HH:mm:ss} после обработки {Count} чатов.",
+                    breakMinutes, DateTime.Now.AddMinutes(breakMinutes), humanBreakCounter);
                 await Task.Delay(TimeSpan.FromMinutes(breakMinutes), cancellationToken);
 
                 humanBreakCounter = 0;
                 nextHumanBreakAt = Random.Shared.Next(15, 26);
+                _logger.LogInformation("☕ Перерыв окончен, продолжаю работу.");
             }
 
             var chat = chats[i];
@@ -706,7 +744,7 @@ public sealed class AdvertisingScheduler : BackgroundService
 
             try
             {
-                await SendToChatAsync(db, chat, messageText, cancellationToken);
+                await SendToChatAsync(db, chat, messageText, chatCache, cancellationToken);
                 humanBreakCounter++;
             }
             catch (RpcException ex) when (ex.Code == 420)
