@@ -314,7 +314,11 @@ public sealed class TelegramCommandProcessor
     {
         try
         {
-            await _clientManager.Client.SendMessageAsync(InputPeer.Self, text);
+            var chunks = TelegramMessageHelper.SplitMessage(text);
+            foreach (var chunk in chunks)
+            {
+                await _clientManager.Client.SendMessageAsync(InputPeer.Self, chunk);
+            }
         }
         catch (Exception ex)
         {

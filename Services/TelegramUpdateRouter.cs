@@ -132,11 +132,15 @@ public sealed class TelegramUpdateRouter
     private async Task ReplyToSavedMessagesAsync(string text)
     {
         var client = _clientManager.Client;
-        
-        // Имитация печатания для естественности
-        await client.Messages_SetTyping(InputPeer.Self, new SendMessageTypingAction());
-        await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(300, 800)));
-        
-        await client.SendMessageAsync(InputPeer.Self, text);
+        var chunks = TelegramMessageHelper.SplitMessage(text);
+
+        foreach (var chunk in chunks)
+        {
+            // Имитация печатания для естественности
+            await client.Messages_SetTyping(InputPeer.Self, new SendMessageTypingAction());
+            await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(300, 800)));
+
+            await client.SendMessageAsync(InputPeer.Self, chunk);
+        }
     }
 }
